@@ -174,7 +174,6 @@ def _band_overlap(a: _Rect, b: _Rect) -> float:
 _FONT_WEIGHTS = {"thin", "light", "extralight", "regular", "medium", "semibold", "bold", "extrabold", "black"}
 _FONT_STYLES = {"regular", "bold", "italic", "bolditalic"}
 _BOLD_WEIGHTS = {"bold", "semibold", "extrabold", "black"}
-_DESCENDERS = set("gjpqyQ,;()[]{}|/@$")
 
 
 def _brand_dir(name: str) -> Path | None:
@@ -346,9 +345,15 @@ class _TextStyle:
     content: str
     font: _Font
     line_height: float
-    letter_spacing: float
+    letter_spacing: float   # px at the source font size
+    base_fs: float          # the source font size
     align: str
     cache: dict = field(default_factory=dict)
+
+    def tracking(self, fs: int) -> float:
+        """Letter spacing at font size fs: tracking is a proportion of the
+        type size, so it scales with it."""
+        return round(self.letter_spacing * fs / self.base_fs, 2) if self.letter_spacing else 0.0
 
 
 def _text_style(el: dict) -> _TextStyle:
@@ -366,6 +371,7 @@ def _text_style(el: dict) -> _TextStyle:
         font=_fonts().lookup(str(el.get("font_family") or "Montserrat"), weight, style),
         line_height=_num(el.get("line_height"), 1.2),
         letter_spacing=_num(el.get("letter_spacing"), 0.0),
+        base_fs=max(1.0, _num(el.get("font_size"), 24.0)),
         align=str(el.get("text_align") or "left"),
     )
 
@@ -430,12 +436,13 @@ def _measure(st: _TextStyle, fs: int, width: float) -> _TextFit:
     # The renderer gives each "\n" to the line after it and strips it.
     lines, line_w = [], []
     start = 0
+    ls = st.tracking(fs)
     for i in range(len(wrapped) + 1):
         if i == len(wrapped) or wrapped[i] == "\n":
             seg = wrapped[start:i]
             w = sum(widths[start:i])
             if len(seg) > 1:
-                w += st.letter_spacing * (len(seg) - 1)
+                w += ls * (len(seg) - 1)
             lines.append(seg)
             line_w.append(w)
             start = i + 1
@@ -443,7 +450,8 @@ def _measure(st: _TextStyle, fs: int, width: float) -> _TextFit:
     lead = fs * st.line_height
     n = len(lines)
     baseline = (n - 1) * lead + asc
-    has_desc = any(c in _DESCENDERS for c in lines[-1])
+    # Always allow for descenders: whether the last line happens to have one
+    # depends on where it wrapped, and spacing shouldn't jump when it changes.
     fit = _TextFit(
         fs=fs,
         width=width,
@@ -452,7 +460,7 @@ def _measure(st: _TextStyle, fs: int, width: float) -> _TextFit:
         height=(n - 1) * lead + asc + desc,
         ink_top=max(0.0, asc - cap),
         baseline=baseline,
-        ink_bottom=baseline + (min(desc, 0.22 * fs) if has_desc else 0.0),
+        ink_bottom=baseline + min(desc, 0.22 * fs),
     )
     st.cache[key] = fit
     return fit
@@ -642,6 +650,8 @@ class _Block:
     align: str = "center"
     grow: float = 1.0           # extra scale for the hero image
     cap_h: float = math.inf     # height limit for the hero image (column layouts)
+    floor: float = 0.0          # smallest font size worth printing on this target
+    k_floor: float = 0.0        # smallest scale for a logo/hero image on this target
     container: _Item | None = None
     label: _Item | None = None
     pad_x: float = 0.0
@@ -652,10 +662,17 @@ class _Block:
         which is all the layout searches need."""
         return getattr(self, "_measure_" + self.kind)(s, max(1.0, max_w), final)
 
+    def _fs(self, it: _Item, s: float) -> int:
+        """Font size at scale s, held at this target's floor for the role
+        (but never pushed past the source's own size)."""
+        return max(1, round(it.fs * s), round(min(self.floor, it.fs)))
+
     def _measure_text(self, s: float, max_w: float, final: bool) -> _Plan:
         it = self.items[0]
-        fs = max(1, round(it.fs * s))
-        want = min(max_w, max(1.0, it.rect.w * s))
+        fs = self._fs(it, s)
+        # Wrap width follows the font size, so a floored font keeps the
+        # source's line breaks rather than squeezing into a scaled box.
+        want = min(max_w, max(1.0, it.rect.w * fs / it.fs))
         while True:
             fit = _fit_width(it.style, fs, want, balance=final)
             if fit.text_w <= max_w + 0.5 or fs == 1:
@@ -669,7 +686,7 @@ class _Block:
 
     def _measure_image(self, s: float, max_w: float, final: bool) -> _Plan:
         it = self.items[0]
-        k = s * self.grow
+        k = max(s * self.grow, self.k_floor)
         w, h = it.rect.w * k, it.rect.h * k
         if w > max_w:
             w, h = max_w, h * max_w / w
@@ -695,9 +712,9 @@ class _Block:
         c, lab = self.container, self.label
         multi = lab.fit.n > 1
         for _ in range(8):
-            fs = max(1, round(lab.fs * s))
+            fs = self._fs(lab, s)
             if multi:
-                fit = _fit_width(lab.style, fs, min(max_w, max(1.0, lab.rect.w * s)), balance=final)
+                fit = _fit_width(lab.style, fs, min(max_w, max(1.0, lab.rect.w * fs / lab.fs)), balance=final)
             else:
                 fit = _fit_width(lab.style, fs, 1e6, balance=False)
             pad = max(self.pad_x * s, 0.5 * fs)
@@ -731,8 +748,12 @@ class _Block:
 
         return _Plan(cw, ch, 0.0, ch, emit)
 
-    def _measure_rigid(self, s: float, max_w: float, final: bool) -> _Plan:
+    def _measure_rigid(self, s: float, max_w: float, final: bool, floors: bool = True) -> _Plan:
         k = s
+        if floors:  # the whole group grows until its text reaches the floor
+            for it in self.items:
+                if it.type == "text":
+                    k = max(k, min(self.floor, it.fs) / it.fs)
         if self.box.w * k > max_w:
             k = max_w / self.box.w
         w, h = self.box.w * k, self.box.h * k
@@ -1046,9 +1067,9 @@ class _Row:
 def _same_row(a: _Block, b: _Block) -> bool:
     """Side by side at a similar height (a tall picture beside a column of
     text is a column layout, not a row)."""
-    tall = max(a.vis.h, b.vis.h) / max(1e-6, min(a.vis.h, b.vis.h))
     apart = a.vis.x1 <= b.vis.x0 or b.vis.x1 <= a.vis.x0
-    return apart and tall <= 2.5 and _band_overlap(a.vis, b.vis) >= 0.5
+    shared = max(0.0, min(a.vis.y1, b.vis.y1) - max(a.vis.y0, b.vis.y0))
+    return apart and shared >= 0.5 * max(a.vis.h, b.vis.h)
 
 
 def _rows(d: _Design, blocks: list[_Block]) -> list[_Row]:
@@ -1184,22 +1205,37 @@ def _fit_stack(d: _Design, rows: list[_Row], area: _Rect, s_hi: float):
         for b in heroes:
             b.grow = lo
     total, plans, gaps = _stack(d, rows, s, area.w)
+    if total > area.h + 0.5 >= height(s):  # balancing must never cost a fit
+        total, plans, gaps = _stack(d, rows, s, area.w, final=False)
     return s, total, plans, gaps
 
 
 def _row_positions(d: _Design, rows: list[_Row], plans: list[_Plan], gaps: list[float],
-                   total: float, area: _Rect) -> list[tuple[float, float]]:
+                   total: float, area: _Rect, s: float) -> list[tuple[float, float]]:
     """Top-left of each row. Spare height is shared between the top, the
-    gaps and the bottom in the same proportions as the source's spacing."""
+    gaps and the bottom in the same proportions as the source's spacing,
+    except that no gap grows past three times its natural size (a tall,
+    narrow canvas would otherwise leave pieces floating far apart); what
+    that holds back goes to the top and bottom instead."""
     if not rows:
         return []
     spare = max(0.0, area.h - total)
     floor = 0.01 * d.H
+    short = min(d.W, d.H)
     src = [rows[0].vis.y0]
     src += [max(rows[k].vis.y0 - rows[k - 1].vis.y1, 0.0) for k in range(1, len(rows))]
     src.append(d.H - rows[-1].vis.y1)
     weights = [max(v, floor) for v in src]
     extra = [spare * w / sum(weights) for w in weights]
+    held = 0.0
+    for k in range(1, len(rows)):
+        cap = 2.0 * _clamp(src[k], 0.02 * short, 0.06 * short) * s
+        if extra[k] > cap:
+            held += extra[k] - cap
+            extra[k] = cap
+    ends = weights[0] + weights[-1]
+    extra[0] += held * weights[0] / ends
+    extra[-1] += held * weights[-1] / ends
     out = []
     y = area.y0 + extra[0]
     for k, (row, plan) in enumerate(zip(rows, plans)):
@@ -1288,6 +1324,8 @@ class _Candidate:
     props: dict[int, dict[str, Any]]
     penalty: float = 0.0                # structural penalty (see _structure_penalty)
     score: float = -math.inf
+    overflow: bool = False              # content didn't fit even at the smallest scale
+    floored: bool = True                # honours the minimum text/image sizes
 
 
 def _stack_orders(rows: list[_Row]) -> list[tuple[list[_Row], float]]:
@@ -1324,7 +1362,7 @@ def _stack_candidate(c: _Ctx, merged: bool, rows: list[_Row], penalty: float) ->
     for _ in range(4):
         area = _Rect(c.mx, c.my + top, tw - c.mx, th - c.my - bottom)
         s, total, plans, gaps = _fit_stack(d, rows, area, c.s_hi)
-        pos = _row_positions(d, rows, plans, gaps, total, area)
+        pos = _row_positions(d, rows, plans, gaps, total, area, s)
         taken = [p.ink(x, y) for (x, y), p in zip(pos, plans)]
         placed = [(b, *_place_corner(d, b, s, tw, th, c.my)) for b in corners]
         changed = False
@@ -1343,7 +1381,8 @@ def _stack_candidate(c: _Ctx, merged: bool, rows: list[_Row], penalty: float) ->
     for b, plan, rect in placed:
         props.update(plan.emit(rect.x0, rect.y0))
     name = "stack " + " / ".join("+".join(b.role for b in r.blocks) for r in rows)
-    return _Candidate(name, s, 1, merged, props, penalty)
+    overflow = total > area.h + 1 or any(p.w > area.w + 1 for p in plans)
+    return _Candidate(name, s, 1, merged, props, penalty, overflow=overflow)
 
 
 def _keep_candidate(c: _Ctx) -> _Candidate | None:
@@ -1358,8 +1397,9 @@ def _keep_candidate(c: _Ctx) -> _Candidate | None:
     ox, oy = (c.tw - d.W * s) / 2, (c.th - d.H * s) / 2
     props: dict[int, dict[str, Any]] = {}
     for b in d.blocks:
-        props.update(b._measure_rigid(s, math.inf, True).emit(ox + b.box.x0 * s, oy + b.box.y0 * s))
-    return _Candidate("keep source arrangement", s, 1, False, props, penalty=-0.05)
+        plan = b._measure_rigid(s, math.inf, True, floors=False)
+        props.update(plan.emit(ox + b.box.x0 * s, oy + b.box.y0 * s))
+    return _Candidate("keep source arrangement", s, 1, False, props, penalty=-0.05, floored=False)
 
 
 def _col_widths(c: _Ctx, cols: list[list[_Row]], s: float, avail: float, final: bool,
@@ -1396,10 +1436,21 @@ def _cols_attempt(c: _Ctx, cols: list[list[_Row]], footer: _Row | None, area: _R
         col_area = _Rect(area.x0, area.y0, area.x1, area.y1 - fplan.h - c.clear)
         if col_area.h <= 0:
             return None
-    widths = _col_widths(c, cols, s, area.w - c.gutter * (len(cols) - 1), final, strict)
+    avail = area.w - c.gutter * (len(cols) - 1)
+    widths = _col_widths(c, cols, s, avail, final, strict)
     if widths is None:
         return None
     stacks = [_stack(d, col, s, w, final) for col, w in zip(cols, widths)]
+    if any(total > col_area.h + 0.5 for total, _, _ in stacks) and not strict:
+        # Too tall: hand the spare width to the text columns that overflow,
+        # so their copy wraps into fewer, longer lines (up to 1.8x as wide).
+        spare = avail - sum(widths)
+        tall = [i for i, (total, _, _) in enumerate(stacks)
+                if total > col_area.h + 0.5 and any(r.flexible for r in cols[i])]
+        if spare > 1 and tall:
+            base = sum(widths[i] for i in tall)
+            widths = [w + min(0.8 * w, spare * w / base) if i in tall else w for i, w in enumerate(widths)]
+            stacks = [_stack(d, col, s, w, final) for col, w in zip(cols, widths)]
     if any(total > col_area.h + 0.5 for total, _, _ in stacks):
         return None
     return widths, stacks, fplan, col_area
@@ -1416,6 +1467,8 @@ def _fit_columns(c: _Ctx, cols: list[list[_Row]], footer: _Row | None, area: _Re
     s = c.s_hi
     if _cols_attempt(c, cols, footer, area, s) is None:
         lo, hi, ok = c.s_hi * 0.02, c.s_hi, None
+        if _cols_attempt(c, cols, footer, area, lo) is None:
+            return None  # doesn't fit even at the smallest scale
         for _ in range(13):
             mid = (lo + hi) / 2
             if _cols_attempt(c, cols, footer, area, mid) is not None:
@@ -1519,14 +1572,18 @@ _MERGE_PENALTY = 0.08
 
 def _structure_penalty(cols: list[list[_Row]]) -> float:
     """Splits a designer wouldn't make: an image stacked over copy or the
-    CTA inside one column of a side-by-side layout, or the headline and its
-    supporting copy spread over several columns."""
+    CTA inside one column of a side-by-side layout, the headline and its
+    supporting copy spread over several columns, or a logo that isn't at
+    the top of its column."""
     roles = [{b.role for r in col for b in r.blocks} for col in cols]
     pen = 0.0
     for rs in roles:
         if rs & _VISUAL and rs & (_MESSAGE | {"cta"}):
             pen += 0.12
     pen += 0.12 * max(0, sum(1 for rs in roles if rs & _MESSAGE) - 1)
+    for col in cols:
+        if any(b.role == "logo" for r in col[1:] for b in r.blocks):
+            pen += 0.05
     return pen
 
 
@@ -1544,6 +1601,41 @@ def _upper_bound(c: _Ctx, cols: list[list[_Row]], area: _Rect) -> float:
     return max(ub, 1e-6)
 
 
+def _effective_scale(c: _Ctx, scale_of: Callable[[_Block], float | None]) -> float:
+    """Importance-weighted geometric mean of how large each piece ended up
+    relative to the source (capped at the ideal scale). With font floors and
+    image minimums in play this, not the layout's base scale, is what a
+    viewer sees."""
+    num = den = 0.0
+    for b in c.d.blocks:
+        k = scale_of(b)
+        if k is not None and k > 0:
+            num += b.importance * math.log(min(k, c.s_hi))
+            den += b.importance
+    return math.exp(num / den) if den else c.s_hi
+
+
+def _placed_scale(b: _Block, props: dict[int, dict[str, Any]]) -> float | None:
+    """How large a block came out in a candidate, relative to the source."""
+    if b.kind == "text" and b.items[0].idx in props:
+        return props[b.items[0].idx]["font_size"] / b.items[0].fs
+    if b.kind == "button" and b.label.idx in props:
+        return props[b.label.idx]["font_size"] / b.label.fs
+    ratios = [props[it.idx]["width"] / it.rect.w for it in b.items if it.idx in props and it.rect.w > 0]
+    return sum(ratios) / len(ratios) if ratios else None
+
+
+def _scale_bound(b: _Block, ub: float) -> float:
+    """The largest relative size a block can reach when the layout's base
+    scale is at most ub (floors and the hero's growth included)."""
+    texts = [it for it in b.items if it.type == "text"]
+    if b.kind == "image":
+        return max(ub * (1.8 if b.role == "hero" else 1.0), b.k_floor)
+    if texts and b.kind != "line":
+        return max([ub] + [min(b.floor, it.fs) / it.fs for it in texts])
+    return ub
+
+
 def _small_text(d: _Design, font_sizes: dict[int, float]) -> float:
     """Importance-weighted shortfall of text below 11px."""
     return sum(b.importance * max(0.0, 1.0 - font_sizes[it.idx] / 11.0)
@@ -1556,7 +1648,8 @@ def _column_candidates(c: _Ctx, to_beat: float) -> list[_Candidate]:
     remaining split can beat the best score found."""
     d = c.d
     aspect = c.tw / c.th
-    kmax = 1 if aspect < 1.25 else 2 if aspect < 1.6 else 3 if aspect < 2.6 else 4
+    kmax = next(k for limit, k in ((1.25, 1), (1.6, 2), (2.6, 3), (4.0, 4), (6.0, 5), (math.inf, 6))
+                if aspect < limit)
     if kmax < 2:
         return []
     area = c.area
@@ -1577,15 +1670,18 @@ def _column_candidates(c: _Ctx, to_beat: float) -> list[_Candidate]:
                         cols = [order[a:b] for a, b in zip(bounds, bounds[1:])]
                         pen = _structure_penalty(cols)
                         ub = _upper_bound(c, cols, area)
-                        # No text can end up larger than at the bound's scale.
-                        small = _small_text(d, {it.idx: max(1, round(it.fs * ub))
-                                                for it in d.items if it.type == "text"})
-                        bound = (math.log(ub / c.s_hi) + 0.3 - pen - 0.6 * small
+                        # No text can end up larger than at the bound's scale
+                        # (or its floor, whichever is bigger).
+                        small = _small_text(d, {it.idx: max(1, round(it.fs * ub), round(min(b.floor, it.fs)))
+                                                for b in d.blocks for it in b.items if it.type == "text"})
+                        eff = _effective_scale(c, lambda b: _scale_bound(b, ub))
+                        bound = (math.log(eff / c.s_hi) + 0.1 * math.log(ub / c.s_hi) + 0.3 - pen - 0.6 * small
                                  - 0.05 * (k - 1) - (_MERGE_PENALTY if merged else 0.0))
                         specs.append((bound, cols, footer, corners, merged, pen))
     specs.sort(key=lambda sp: -sp[0])
     out = []
-    for bound, cols, footer, corners, merged, pen in specs:
+    # Best-first, so the cap only drops splits that already looked worst.
+    for bound, cols, footer, corners, merged, pen in specs[:250]:
         if bound <= to_beat:
             break
         cand = _columns_candidate(c, cols, footer, corners, merged)
@@ -1633,12 +1729,26 @@ def _score(c: _Ctx, cand: _Candidate) -> float:
     for i, a in enumerate(drawn):
         for o in drawn[i + 1:]:
             clash += a.overlap(o) / max(1.0, min(a.area, o.area))
-    return (math.log(max(cand.s, 1e-6) / c.s_hi) + 0.3 * fill - 0.6 * small - 1.5 * clash
-            - cand.penalty - 0.05 * (cand.columns - 1) - (_MERGE_PENALTY if cand.merged else 0.0))
+    eff = _effective_scale(c, lambda b: _placed_scale(b, cand.props))
+    # The base scale still counts a little: when floors make two layouts'
+    # text equal, the one with more room for everything else is better.
+    base = 0.1 * math.log(max(cand.s, 1e-6) / c.s_hi)
+    return (math.log(max(eff, 1e-6) / c.s_hi) + base + 0.3 * fill - 0.6 * small - 1.5 * clash
+            - cand.penalty - 0.05 * (cand.columns - 1) - (_MERGE_PENALTY if cand.merged else 0.0)
+            - (2.0 if cand.overflow else 0.0))
 
 
-def _layout(d: _Design, tw: int, th: int) -> dict[int, dict[str, Any]]:
-    c = _ctx(d, tw, th)
+# Smallest font size worth printing, per role: (px, share of the target's
+# short side). The share keeps a 50px-tall banner from being asked for 16px
+# headlines; the px value keeps big canvases from demanding huge text.
+_FLOORS = {
+    "headline": (16, 0.22), "subhead": (11, 0.14), "body": (10, 0.14), "cta": (10, 0.14),
+    "badge": (8, 0.12), "ribbon": (8, 0.12), "fineprint": (7, 0.10),
+}
+
+
+def _candidates(c: _Ctx) -> list[_Candidate]:
+    d = c.d
     cands = []
     for merged in ((False, True) if d.corners else (False,)):
         for order, pen in _stack_orders(_rows(d, d.blocks if merged else d.flow)):
@@ -1648,12 +1758,40 @@ def _layout(d: _Design, tw: int, th: int) -> dict[int, dict[str, Any]]:
         cands.append(keep)
     for cand in cands:
         cand.score = _score(c, cand)
-    cands += _column_candidates(c, max(k.score for k in cands))
-    best = max(cands, key=lambda k: k.score)
+    return cands + _column_candidates(c, max(k.score for k in cands))
+
+
+def _layout(d: _Design, tw: int, th: int) -> dict[int, dict[str, Any]]:
+    c = _ctx(d, tw, th)
+    short = min(tw, th)
+    # Text and the logo/hero image are held at readable minimum sizes. If
+    # no layout fits even then, the floors are relaxed a step at a time, the
+    # images' first (every element always stays visible). The best layout
+    # from any round wins.
+    pool: list[_Candidate] = []
+    for relax, img_relax in ((1, 1), (1, 0.6), (1, 0), (0.8, 0), (0.64, 0), (0.51, 0), (0.41, 0)):
+        for b in d.blocks:
+            px, share = _FLOORS.get(b.role, (9, 0.12))
+            b.floor = relax * min(px, share * short)
+            if b.kind == "image":
+                # Minimum visible height: a brand mark or product that
+                # shrinks to a speck on a small banner isn't "intact", and
+                # no image may shrink out of sight at all.
+                want = {"logo": min(24.0, 0.3 * th, 0.12 * tw),
+                        "hero": min(160.0, 0.4 * th, 0.3 * tw)}.get(b.role, 0.0)
+                b.k_floor = max(img_relax * want, min(12.0, 0.15 * short)) / max(1.0, b.vis.h)
+        cands = _candidates(c)
+        for k in cands:
+            k.name += f" floors x{relax:.2f}/{img_relax:.1f}" if (relax, img_relax) != (1, 1) else ""
+        pool += cands
+        if any(k.floored and not k.overflow for k in cands):
+            break
+    best = max(pool, key=lambda k: k.score)
     if _DEBUG:
-        for k in sorted(cands, key=lambda k: -k.score)[:5]:
+        for k in sorted(pool, key=lambda k: -k.score)[:5]:
             print(f"[resize] {tw}x{th} {k.score:+.3f} s={k.s:.3f} {k.name}"
-                  f"{' (corners in flow)' if k.merged else ''}", file=sys.stderr)
+                  f"{' (corners in flow)' if k.merged else ''}{' OVERFLOW' if k.overflow else ''}",
+                  file=sys.stderr)
 
     props = dict(best.props)
     for it in d.backgrounds:
@@ -1732,6 +1870,8 @@ def _settle(it: _Item, p: dict[str, Any], tw: int, th: int) -> dict[str, Any]:
     out = {"x": x, "y": y, "width": w, "height": h}
     if fs is not None:
         out["font_size"] = fs
+        if it.style.letter_spacing:
+            out["letter_spacing"] = it.style.tracking(fs)
     for k in ("corner_radius", "stroke_width"):
         if k in p:
             out[k] = round(max(0.0, _num(p[k])), 2)
