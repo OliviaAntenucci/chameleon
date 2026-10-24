@@ -11,7 +11,10 @@ resize() runs in three stages:
   2. Lay out   (_layout)    Rebuild the design for the target canvas from
                             those pieces: text re-flows, images keep their
                             proportions, grouped pieces travel together,
-                            corner pieces stay in their corners.
+                            corner pieces stay in their corners. Several
+                            candidate layouts (one column, 2-4 side-by-side
+                            columns, the source's own arrangement) are
+                            scored and the best one wins.
   3. Finalise  (_finalise)  Hard guarantees that hold whatever the layout
                             did: every id exactly once, everything inside the
                             canvas, image aspect ratios kept, integer font
@@ -25,7 +28,9 @@ fails outright.
 from __future__ import annotations
 
 import copy
+import itertools
 import math
+import os
 import re
 import sys
 from dataclasses import dataclass, field
@@ -41,6 +46,9 @@ try:
     from PIL import Image, ImageFont
 except Exception:  # pragma: no cover
     Image = ImageFont = None
+
+# Set CHAMELEON_DEBUG=1 to print the top-scoring candidate layouts per task.
+_DEBUG = bool(os.environ.get("CHAMELEON_DEBUG"))
 
 
 def resize(source: dict[str, Any], target_canvas: dict[str, Any]) -> dict[str, Any]:
@@ -454,8 +462,10 @@ def _fit_width(st: _TextStyle, fs: int, max_w: float, balance: bool = True) -> _
     """Wrap at `max_w`, then shrink the box to the text: a single line is
     shrink-wrapped, several lines are balanced (the narrowest width that
     keeps the same line count), so headlines don't end on a lone word.
-    The returned box is never narrower than its widest drawn line."""
-    max_w = max(1.0, max_w)
+    The returned box is never narrower than its widest drawn line.
+    Unbalanced fits are search-time estimates: their width is rounded down
+    to a whole pixel (never optimistic) so repeated searches share a cache."""
+    max_w = max(1.0, max_w if balance else math.floor(max_w))
     fit = _measure(st, fs, max_w)
     if fit.n == 1:
         w = fit.text_w + 0.5
@@ -585,12 +595,19 @@ def _starts_with_verb(text: str) -> bool:
 @dataclass
 class _Plan:
     """A block measured at some scale: its box size, where its visible
-    content starts and ends vertically, and how to write it out."""
+    content sits inside that box, and how to write it out."""
     w: float
     h: float
     ink_top: float
     ink_bottom: float
     emit: Callable[[float, float], dict[int, dict[str, Any]]]
+    ink_left: float = 0.0
+    ink_right: float | None = None  # None = the full width
+
+    def ink(self, x: float, y: float) -> _Rect:
+        """The visible content when the box is placed at (x, y)."""
+        right = self.w if self.ink_right is None else self.ink_right
+        return _Rect(x + self.ink_left, y + self.ink_top, x + right, y + self.ink_bottom)
 
 
 def _shape_props(it: _Item, k: float, h: float | None = None) -> dict[str, Any]:
@@ -623,20 +640,24 @@ class _Block:
     importance: float = 0.5
     corner: str | None = None   # "tl"/"tr"/"bl"/"br" for corner pieces
     align: str = "center"
-    grow: float = 1.0
+    grow: float = 1.0           # extra scale for the hero image
+    cap_h: float = math.inf     # height limit for the hero image (column layouts)
     container: _Item | None = None
     label: _Item | None = None
     pad_x: float = 0.0
 
-    def measure(self, s: float, max_w: float) -> _Plan:
-        return getattr(self, "_measure_" + self.kind)(s, max(1.0, max_w))
+    def measure(self, s: float, max_w: float, final: bool = True) -> _Plan:
+        """Size this block at content scale s within max_w. `final=False`
+        skips line balancing (same lines and height, only a wider box),
+        which is all the layout searches need."""
+        return getattr(self, "_measure_" + self.kind)(s, max(1.0, max_w), final)
 
-    def _measure_text(self, s: float, max_w: float) -> _Plan:
+    def _measure_text(self, s: float, max_w: float, final: bool) -> _Plan:
         it = self.items[0]
         fs = max(1, round(it.fs * s))
         want = min(max_w, max(1.0, it.rect.w * s))
         while True:
-            fit = _fit_width(it.style, fs, want)
+            fit = _fit_width(it.style, fs, want, balance=final)
             if fit.text_w <= max_w + 0.5 or fs == 1:
                 break
             fs = max(1, min(fs - 1, int(fs * max_w / fit.text_w)))
@@ -646,20 +667,22 @@ class _Block:
 
         return _Plan(fit.width, fit.height, fit.ink_top, fit.ink_bottom, emit)
 
-    def _measure_image(self, s: float, max_w: float) -> _Plan:
+    def _measure_image(self, s: float, max_w: float, final: bool) -> _Plan:
         it = self.items[0]
         k = s * self.grow
         w, h = it.rect.w * k, it.rect.h * k
         if w > max_w:
             w, h = max_w, h * max_w / w
-        _, t, _, b = it.frac
+        if h > self.cap_h:
+            w, h = w * self.cap_h / h, self.cap_h
+        l, t, r, b = it.frac
 
         def emit(x: float, y: float) -> dict[int, dict[str, Any]]:
             return {it.idx: {"x": x, "y": y, "width": w, "height": h}}
 
-        return _Plan(w, h, t * h, b * h, emit)
+        return _Plan(w, h, t * h, b * h, emit, l * w, r * w)
 
-    def _measure_line(self, s: float, max_w: float) -> _Plan:
+    def _measure_line(self, s: float, max_w: float, final: bool) -> _Plan:
         it = self.items[0]
         w, h = min(it.rect.w * s, max_w), max(1.0, it.rect.h * s)
 
@@ -668,13 +691,13 @@ class _Block:
 
         return _Plan(w, h, 0.0, h, emit)
 
-    def _measure_button(self, s: float, max_w: float) -> _Plan:
+    def _measure_button(self, s: float, max_w: float, final: bool) -> _Plan:
         c, lab = self.container, self.label
         multi = lab.fit.n > 1
         for _ in range(8):
             fs = max(1, round(lab.fs * s))
             if multi:
-                fit = _fit_width(lab.style, fs, min(max_w, max(1.0, lab.rect.w * s)))
+                fit = _fit_width(lab.style, fs, min(max_w, max(1.0, lab.rect.w * s)), balance=final)
             else:
                 fit = _fit_width(lab.style, fs, 1e6, balance=False)
             pad = max(self.pad_x * s, 0.5 * fs)
@@ -708,7 +731,7 @@ class _Block:
 
         return _Plan(cw, ch, 0.0, ch, emit)
 
-    def _measure_rigid(self, s: float, max_w: float) -> _Plan:
+    def _measure_rigid(self, s: float, max_w: float, final: bool) -> _Plan:
         k = s
         if self.box.w * k > max_w:
             k = max_w / self.box.w
@@ -822,11 +845,12 @@ class _Design:
         owner: dict[int, str] = {}
         for t in (it for it in singles if it.type == "text" and not it.rot):
             best = None
+            line = t.fit.height / t.fit.n
             for sh in shapes:
                 if (sh.z, sh.idx) > (t.z, t.idx) or sh.rect.area <= 0:
                     continue
-                if sh.rect.area > 12 * max(t.vis.area, 1.0):
-                    continue
+                if sh.rect.h > 3.5 * line * t.fit.n or sh.rect.w > t.fit.text_w + 8 * t.fs:
+                    continue  # not snug around the text
                 if t.vis.overlap(sh.rect) < 0.8 * t.vis.area or not sh.rect.contains_pt(t.vis.cx, t.vis.cy):
                     continue
                 if best is None or sh.rect.area < best.rect.area:
@@ -898,7 +922,8 @@ class _Design:
                     b.role = "cta"
                 elif prominence(b) >= 0.6 * pmax:
                     b.role = "subhead"
-                elif it.fs <= 0.45 * fmax and it.fs <= 0.02 * min(W, H):
+                elif (it.fs <= 0.45 * fmax and it.fs <= 0.02 * min(W, H)
+                      and (b.vis.cy >= 0.75 * H or len(it.style.content) >= 60)):
                     b.role = "fineprint"
                 else:
                     b.role = "body"
@@ -981,6 +1006,15 @@ class _Design:
 
 # ---------------------------------------------------------------------------
 # Stage 2: layout
+#
+# Several candidate layouts are built for the target and scored, and the
+# best one wins (_layout). Candidates:
+#   stack    one column in the source's reading order (the natural choice
+#            for square and portrait targets)
+#   columns  the reading order split into 2-4 side-by-side columns, with
+#            the hero image optionally moved to the front or the back, and
+#            fine print optionally run as a full-width footer (landscape)
+# In each, corner pieces either keep to their corners or join the flow.
 # ---------------------------------------------------------------------------
 
 @dataclass(eq=False)
@@ -990,14 +1024,38 @@ class _Row:
     vis: _Rect
     align: str
     hgap: float
+    cache: dict = field(default_factory=dict)
+
+    @property
+    def flexible(self) -> bool:
+        """Can the row get narrower (text re-flows, a strip wraps)?"""
+        return len(self.blocks) > 1 or any(b.kind == "text" for b in self.blocks)
+
+    @property
+    def natural_w(self) -> float:
+        """Source width of the row's boxes laid end to end."""
+        return sum(b.box.w for b in self.blocks) + self.hgap * (len(self.blocks) - 1)
+
+    @property
+    def min_h(self) -> float:
+        """Lower bound on the row's source height: one line of any text."""
+        return max(b.items[0].fit.height / b.items[0].fit.n if b.kind == "text" else b.box.h
+                   for b in self.blocks)
+
+
+def _same_row(a: _Block, b: _Block) -> bool:
+    """Side by side at a similar height (a tall picture beside a column of
+    text is a column layout, not a row)."""
+    tall = max(a.vis.h, b.vis.h) / max(1e-6, min(a.vis.h, b.vis.h))
+    apart = a.vis.x1 <= b.vis.x0 or b.vis.x1 <= a.vis.x0
+    return apart and tall <= 2.5 and _band_overlap(a.vis, b.vis) >= 0.5
 
 
 def _rows(d: _Design, blocks: list[_Block]) -> list[_Row]:
     rows: list[list[_Block]] = []
     for b in sorted(blocks, key=lambda b: (b.vis.y0, b.vis.x0)):
         for row in rows:
-            if all(_band_overlap(o.vis, b.vis) >= 0.5 and (o.vis.x1 <= b.vis.x0 or b.vis.x1 <= o.vis.x0)
-                   for o in row):
+            if all(_same_row(o, b) for o in row):
                 row.append(b)
                 break
         else:
@@ -1018,12 +1076,21 @@ def _rows(d: _Design, blocks: list[_Block]) -> list[_Row]:
     return out
 
 
-def _measure_row(d: _Design, row: _Row, s: float, max_w: float) -> _Plan:
+def _measure_row(d: _Design, row: _Row, s: float, max_w: float, final: bool = True) -> _Plan:
+    # Candidate searches re-measure the same row at the same scales a lot.
+    key = (round(s, 6), round(max_w, 2), final, tuple((b.grow, b.cap_h) for b in row.blocks))
+    hit = row.cache.get(key)
+    if hit is None:
+        hit = row.cache[key] = _measure_row_uncached(d, row, s, max_w, final)
+    return hit
+
+
+def _measure_row_uncached(d: _Design, row: _Row, s: float, max_w: float, final: bool) -> _Plan:
     def line_w(ln: list[_Plan], g: float) -> float:
         return sum(p.w for p in ln) + g * (len(ln) - 1)
 
     base_gap = max(row.hgap, 0.015 * min(d.W, d.H))
-    plans = [b.measure(s, max_w) for b in row.blocks]
+    plans = [b.measure(s, max_w, final) for b in row.blocks]
     gap = base_gap * s
     # A strip that is a little too wide shrinks to fit (up to 20%) rather
     # than wrapping; one that is far too wide wraps into even lines.
@@ -1033,10 +1100,10 @@ def _measure_row(d: _Design, row: _Row, s: float, max_w: float) -> _Plan:
         if len(plans) < 2 or over <= max_w + 0.5 or k < 0.8 * s:
             break
         k *= max_w / over * 0.995
-        plans = [b.measure(k, max_w) for b in row.blocks]
+        plans = [b.measure(k, max_w, final) for b in row.blocks]
         gap = base_gap * k
     if line_w(plans, gap) > max_w + 0.5 and k < 0.8 * s:
-        plans = [b.measure(s, max_w) for b in row.blocks]
+        plans = [b.measure(s, max_w, final) for b in row.blocks]
         gap = base_gap * s
     lines = [plans]
     if line_w(plans, gap) > max_w + 0.5:
@@ -1057,8 +1124,7 @@ def _measure_row(d: _Design, row: _Row, s: float, max_w: float) -> _Plan:
             x += p.w + gap
         y += lh + gap
     row_h = y - gap
-    ink_top = min(oy + p.ink_top for p, _, oy in placed)
-    ink_bottom = max(oy + p.ink_bottom for p, _, oy in placed)
+    inks = [p.ink(ox, oy) for p, ox, oy in placed]
 
     def emit(x: float, y: float) -> dict[int, dict[str, Any]]:
         out: dict[int, dict[str, Any]] = {}
@@ -1066,17 +1132,21 @@ def _measure_row(d: _Design, row: _Row, s: float, max_w: float) -> _Plan:
             out.update(p.emit(x + ox, y + oy))
         return out
 
-    return _Plan(row_w, row_h, ink_top, ink_bottom, emit)
+    return _Plan(row_w, row_h, min(r.y0 for r in inks), max(r.y1 for r in inks), emit,
+                 min(r.x0 for r in inks), max(r.x1 for r in inks))
 
 
-def _stack(d: _Design, rows: list[_Row], s: float, max_w: float) -> tuple[float, list[_Plan], list[float]]:
+def _stack(d: _Design, rows: list[_Row], s: float, max_w: float,
+           final: bool = True) -> tuple[float, list[_Plan], list[float]]:
     """Measure rows stacked top to bottom at scale s. Gaps keep the source's
-    visual rhythm (measured between visible pixels, not boxes)."""
-    plans = [_measure_row(d, r, s, max_w) for r in rows]
-    floor = 0.02 * min(d.W, d.H)
+    visual rhythm (measured between visible pixels, not boxes), within
+    limits: very loose source spacing counts as spare room, not as a gap
+    the layout must reproduce."""
+    plans = [_measure_row(d, r, s, max_w, final) for r in rows]
+    short = min(d.W, d.H)
     gaps = []
     for k in range(1, len(rows)):
-        want = max(rows[k].vis.y0 - rows[k - 1].vis.y1, floor) * s
+        want = _clamp(rows[k].vis.y0 - rows[k - 1].vis.y1, 0.02 * short, 0.06 * short) * s
         prev, nxt = plans[k - 1], plans[k]
         gaps.append(max(0.0, want - (prev.h - prev.ink_bottom) - nxt.ink_top))
     return sum(p.h for p in plans) + sum(gaps), plans, gaps
@@ -1086,38 +1156,34 @@ def _fit_stack(d: _Design, rows: list[_Row], area: _Rect, s_hi: float):
     """Largest scale (up to s_hi) at which the stacked rows fit `area`,
     then let the hero image soak up some of any spare height."""
     for b in (b for r in rows for b in r.blocks):
-        b.grow = 1.0
+        b.grow, b.cap_h = 1.0, math.inf
     if not rows:
         return s_hi, 0.0, [], []
-    total, plans, gaps = _stack(d, rows, s_hi, area.w)
+
+    def height(s: float) -> float:
+        return _stack(d, rows, s, area.w, final=False)[0]
+
     s = s_hi
-    if total > area.h:
-        lo, hi, best = s_hi * 0.02, s_hi, None
-        for _ in range(22):
+    if height(s) > area.h:
+        lo, hi = s_hi * 0.02, s_hi
+        for _ in range(18):
             mid = (lo + hi) / 2
-            t, p, g = _stack(d, rows, mid, area.w)
-            if t <= area.h:
-                lo, best = mid, (mid, t, p, g)
-            else:
-                hi = mid
-        s, total, plans, gaps = best or (lo, *_stack(d, rows, lo, area.w))
+            lo, hi = (mid, hi) if height(mid) <= area.h else (lo, mid)
+        s = lo
 
     heroes = [b for r in rows for b in r.blocks if b.role == "hero"]
-    spare = area.h - total
+    spare = area.h - height(s)
     if heroes and spare > 0.08 * area.h:
-        budget = total + 0.5 * spare
+        budget = area.h - 0.5 * spare
         lo, hi = 1.0, 1.8
-        for _ in range(14):
+        for _ in range(12):
             mid = (lo + hi) / 2
             for b in heroes:
                 b.grow = mid
-            if _stack(d, rows, s, area.w)[0] <= budget:
-                lo = mid
-            else:
-                hi = mid
+            lo, hi = (mid, hi) if height(s) <= budget else (lo, mid)
         for b in heroes:
             b.grow = lo
-        total, plans, gaps = _stack(d, rows, s, area.w)
+    total, plans, gaps = _stack(d, rows, s, area.w)
     return s, total, plans, gaps
 
 
@@ -1183,43 +1249,416 @@ def _place_decor(d: _Design, it: _Item, sd: float, tw: int, th: int) -> dict[str
     return {"x": x, "y": y, "width": w, "height": h, **_shape_props(it, sd)}
 
 
-def _layout(d: _Design, tw: int, th: int) -> dict[int, dict[str, Any]]:
-    """Milestone-1 layout: one centred column (the source's reading order,
-    top to bottom) with corner pieces in their corners. Works for square
-    and portrait targets; wide and extreme targets come in later milestones."""
-    props: dict[int, dict[str, Any]] = {}
-    for it in d.backgrounds:
-        props[it.idx] = {"x": 0, "y": 0, "width": tw, "height": th}
+@dataclass
+class _Ctx:
+    """Target-specific constants shared by every candidate."""
+    d: _Design
+    tw: int
+    th: int
+    mx: float      # side margin
+    my: float      # top/bottom margin
+    gutter: float  # minimum space between columns
+    clear: float   # minimum clearance between unrelated pieces
+    s_hi: float    # the largest content scale worth using
 
-    rx, ry = tw / d.W, th / d.H
-    s_hi = min(max(rx, ry), 1.1 * math.sqrt(rx * ry))
+    @property
+    def area(self) -> _Rect:
+        return _Rect(self.mx, self.my, self.tw - self.mx, self.th - self.my)
+
+
+def _ctx(d: _Design, tw: int, th: int) -> _Ctx:
     m = d.margin_ratio() * min(tw, th)
-    rows = _rows(d, d.flow)
-    corners = d.corners
-    reserve_top = reserve_bottom = 0.0
-    gap = 0.02 * min(tw, th)
+    rx, ry = tw / d.W, th / d.H
+    return _Ctx(
+        d, tw, th,
+        mx=max(m, min(0.035 * tw, 2.5 * m)), my=m,
+        gutter=max(2 * m, 0.03 * tw), clear=0.02 * min(tw, th),
+        # Content may grow with the canvas, but not past the geometric mean
+        # of the two axis ratios (+10%), so a tall canvas doesn't blow text up.
+        s_hi=min(max(rx, ry), 1.1 * math.sqrt(rx * ry)),
+    )
+
+
+@dataclass
+class _Candidate:
+    name: str
+    s: float                            # content scale it achieved
+    columns: int
+    merged: bool                        # corner pieces joined the flow
+    props: dict[int, dict[str, Any]]
+    penalty: float = 0.0                # structural penalty (see _structure_penalty)
+    score: float = -math.inf
+
+
+def _stack_orders(rows: list[_Row]) -> list[tuple[list[_Row], float]]:
+    """Row orders worth trying for a single column, with their penalty. If
+    the hero image interrupts the copy in reading order (it sat beside the
+    copy in the source), also try it just before and just after the copy."""
+    copy_roles = _MESSAGE | {"cta"}
+    hero = next((r for r in rows if any(b.role == "hero" for b in r.blocks)), None)
+    is_copy = [any(b.role in copy_roles for b in r.blocks) for r in rows]
+    if hero is None:
+        return [(rows, 0.0)]
+    h = rows.index(hero)
+    if not (any(is_copy[:h]) and any(is_copy[h + 1:])):
+        return [(rows, 0.0)]
+    out = [(rows, 0.06)]
+    rest = [r for r in rows if r is not hero]
+    copy_at = [i for i, r in enumerate(rest) if any(b.role in copy_roles for b in r.blocks)]
+    seen = {tuple(map(id, rows))}
+    for at in (copy_at[0], copy_at[-1] + 1):
+        order = rest[:at] + [hero] + rest[at:]
+        key = tuple(map(id, order))
+        if key not in seen:
+            seen.add(key)
+            out.append((order, 0.01))
+    return out
+
+
+def _stack_candidate(c: _Ctx, merged: bool, rows: list[_Row], penalty: float) -> _Candidate:
+    """One column. Corner pieces that would collide with it claim a band
+    along their edge, pushing the column down (or up)."""
+    d, tw, th = c.d, c.tw, c.th
+    corners = [] if merged else d.corners
+    top = bottom = 0.0
     for _ in range(4):
-        area = _Rect(m, m + reserve_top, tw - m, th - m - reserve_bottom)
-        s, total, plans, gaps = _fit_stack(d, rows, area, s_hi)
+        area = _Rect(c.mx, c.my + top, tw - c.mx, th - c.my - bottom)
+        s, total, plans, gaps = _fit_stack(d, rows, area, c.s_hi)
         pos = _row_positions(d, rows, plans, gaps, total, area)
-        row_rects = [_Rect.xywh(x, y, p.w, p.h) for (x, y), p in zip(pos, plans)]
-        placed = [(b, *_place_corner(d, b, s, tw, th, m)) for b in corners]
+        taken = [p.ink(x, y) for (x, y), p in zip(pos, plans)]
+        placed = [(b, *_place_corner(d, b, s, tw, th, c.my)) for b in corners]
         changed = False
         for b, plan, rect in placed:
-            if not any(rect.intersects(rr, gap) for rr in row_rects):
+            if not any(plan.ink(rect.x0, rect.y0).intersects(t, c.clear) for t in taken):
                 continue
-            if b.corner[0] == "t" and rect.y1 + gap - m > reserve_top:
-                reserve_top, changed = rect.y1 + gap - m, True
-            elif b.corner[0] == "b" and th - rect.y0 + gap - m > reserve_bottom:
-                reserve_bottom, changed = th - rect.y0 + gap - m, True
-        if not changed or reserve_top + reserve_bottom > 0.45 * th:
+            if b.corner[0] == "t" and rect.y1 + c.clear - c.my > top:
+                top, changed = rect.y1 + c.clear - c.my, True
+            elif b.corner[0] == "b" and th - rect.y0 + c.clear - c.my > bottom:
+                bottom, changed = th - rect.y0 + c.clear - c.my, True
+        if not changed or top + bottom > 0.45 * th:
             break
-
+    props: dict[int, dict[str, Any]] = {}
     for (x, y), plan in zip(pos, plans):
         props.update(plan.emit(x, y))
     for b, plan, rect in placed:
         props.update(plan.emit(rect.x0, rect.y0))
-    sd = max(s, min(rx, ry))
+    name = "stack " + " / ".join("+".join(b.role for b in r.blocks) for r in rows)
+    return _Candidate(name, s, 1, merged, props, penalty)
+
+
+def _keep_candidate(c: _Ctx) -> _Candidate | None:
+    """For a target close to the source's shape, the designer's own
+    arrangement scaled uniformly is often the most faithful answer. It gets
+    a small bonus, but its collisions are scored like anyone else's, so a
+    source with overlapping pieces still gets re-laid-out."""
+    d = c.d
+    if abs(math.log((c.tw / c.th) / (d.W / d.H))) > math.log(1.2):
+        return None
+    s = min(c.tw / d.W, c.th / d.H)
+    ox, oy = (c.tw - d.W * s) / 2, (c.th - d.H * s) / 2
+    props: dict[int, dict[str, Any]] = {}
+    for b in d.blocks:
+        props.update(b._measure_rigid(s, math.inf, True).emit(ox + b.box.x0 * s, oy + b.box.y0 * s))
+    return _Candidate("keep source arrangement", s, 1, False, props, penalty=-0.05)
+
+
+def _col_widths(c: _Ctx, cols: list[list[_Row]], s: float, avail: float, final: bool,
+                strict: bool) -> list[float] | None:
+    """Column widths at scale s: each column's natural width, with text
+    columns giving up width (re-flowing) when the total doesn't fit.
+    `strict` refuses any squeeze (used while growing the hero image)."""
+    d = c.d
+    prefs, mins = [], []
+    for col in cols:
+        pref = low = 0.0
+        for r in col:
+            w = _measure_row(d, r, s, 1e9, final).w
+            pref = max(pref, w)
+            low = max(low, _measure_row(d, r, s, 0.45 * w, final).w if r.flexible else w)
+        prefs.append(pref)
+        mins.append(min(low, pref))
+    deficit = sum(prefs) - avail
+    if deficit <= 0:
+        return prefs
+    slack = [p - m for p, m in zip(prefs, mins)]
+    if strict or sum(slack) < deficit:
+        return None
+    return [p - deficit * sl / sum(slack) for p, sl in zip(prefs, slack)]
+
+
+def _cols_attempt(c: _Ctx, cols: list[list[_Row]], footer: _Row | None, area: _Rect, s: float,
+                  final: bool = False, strict: bool = False):
+    """Lay the columns out at scale s inside `area`; None if they don't fit."""
+    d = c.d
+    col_area, fplan = area, None
+    if footer is not None:
+        fplan = _measure_row(d, footer, s, area.w, final)
+        col_area = _Rect(area.x0, area.y0, area.x1, area.y1 - fplan.h - c.clear)
+        if col_area.h <= 0:
+            return None
+    widths = _col_widths(c, cols, s, area.w - c.gutter * (len(cols) - 1), final, strict)
+    if widths is None:
+        return None
+    stacks = [_stack(d, col, s, w, final) for col, w in zip(cols, widths)]
+    if any(total > col_area.h + 0.5 for total, _, _ in stacks):
+        return None
+    return widths, stacks, fplan, col_area
+
+
+def _fit_columns(c: _Ctx, cols: list[list[_Row]], footer: _Row | None, area: _Rect):
+    """Largest scale at which the columns fit, then grow the hero image into
+    any genuinely free space. Returns (scale, props, occupied rects)."""
+    blocks = [b for col in cols for r in col for b in r.blocks] + (footer.blocks if footer else [])
+    for b in blocks:
+        # Beside the copy, the hero only needs to fill its column's height;
+        # it shouldn't hold the copy's size hostage in a short banner.
+        b.grow, b.cap_h = 1.0, (area.h if b.role == "hero" else math.inf)
+    s = c.s_hi
+    if _cols_attempt(c, cols, footer, area, s) is None:
+        lo, hi, ok = c.s_hi * 0.02, c.s_hi, None
+        for _ in range(13):
+            mid = (lo + hi) / 2
+            if _cols_attempt(c, cols, footer, area, mid) is not None:
+                lo = ok = mid
+            else:
+                hi = mid
+        if ok is None:
+            return None
+        s = ok
+    heroes = [b for b in blocks if b.role == "hero"]
+    if heroes and _cols_attempt(c, cols, footer, area, s, strict=True) is not None:
+        lo, hi = 1.0, 1.8
+        for _ in range(8):
+            mid = (lo + hi) / 2
+            for b in heroes:
+                b.grow = mid
+            fits = _cols_attempt(c, cols, footer, area, s, strict=True) is not None
+            lo, hi = (mid, hi) if fits else (lo, mid)
+        for b in heroes:
+            b.grow = lo
+    got = _cols_attempt(c, cols, footer, area, s, final=True) or _cols_attempt(c, cols, footer, area, s)
+    if got is None:
+        return None
+    widths, stacks, fplan, col_area = got
+
+    # Columns sit side by side, each centred vertically; spare width widens
+    # the gutters a little and otherwise centres the whole group.
+    k = len(cols)
+    free = max(0.0, area.w - sum(widths) - c.gutter * (k - 1))
+    extra = min(free / (k + 1), 0.06 * c.tw)
+    x = area.x0 + (free - extra * (k - 1)) / 2
+    props: dict[int, dict[str, Any]] = {}
+    taken: list[_Rect] = []
+    for col, w, (total, plans, gaps) in zip(cols, widths, stacks):
+        y = col_area.y0 + (col_area.h - total) / 2
+        for i, (row, plan) in enumerate(zip(col, plans)):
+            rx = {"left": x, "right": x + w - plan.w}.get(row.align, x + (w - plan.w) / 2)
+            props.update(plan.emit(rx, y))
+            taken.append(plan.ink(rx, y))
+            y += plan.h + (gaps[i] if i < len(gaps) else 0.0)
+        x += w + c.gutter + extra
+    if fplan is not None:
+        fx = {"left": area.x0, "right": area.x1 - fplan.w}.get(footer.align, area.x0 + (area.w - fplan.w) / 2)
+        props.update(fplan.emit(fx, area.y1 - fplan.h))
+        taken.append(fplan.ink(fx, area.y1 - fplan.h))
+    return s, props, taken
+
+
+def _columns_candidate(c: _Ctx, cols: list[list[_Row]], footer: _Row | None, corners: list[_Block],
+                       merged: bool) -> _Candidate | None:
+    """Columns side by side. Corner pieces that would collide with them
+    claim a strip down their side of the canvas."""
+    tw, th = c.tw, c.th
+    left = right = 0.0
+    for _ in range(3):
+        area = _Rect(c.mx + left, c.my, tw - c.mx - right, th - c.my)
+        fit = _fit_columns(c, cols, footer, area)
+        if fit is None:
+            return None
+        s, props, taken = fit
+        placed = [(b, *_place_corner(c.d, b, s, tw, th, c.my)) for b in corners]
+        changed = False
+        for b, plan, rect in placed:
+            if not any(plan.ink(rect.x0, rect.y0).intersects(t, c.clear) for t in taken):
+                continue
+            if b.corner[1] == "l" and rect.x1 + c.clear - c.mx > left:
+                left, changed = rect.x1 + c.clear - c.mx, True
+            elif b.corner[1] == "r" and tw - rect.x0 + c.clear - c.mx > right:
+                right, changed = tw - rect.x0 + c.clear - c.mx, True
+        if not changed or left + right > 0.4 * tw:
+            break
+    for b, plan, rect in placed:
+        props.update(plan.emit(rect.x0, rect.y0))
+    name = "columns " + " | ".join("+".join(b.role for r in col for b in r.blocks) for col in cols)
+    if footer is not None:
+        name += " / footer"
+    return _Candidate(name, s, len(cols), merged, props)
+
+
+def _orders(rows: list[_Row]) -> list[list[_Row]]:
+    """The reading order, plus the hero image moved to the front and to the back."""
+    out = [rows]
+    hero = next((r for r in rows if any(b.role == "hero" for b in r.blocks)), None)
+    if hero is not None:
+        rest = [r for r in rows if r is not hero]
+        seen = {tuple(map(id, rows))}
+        for order in ([hero] + rest, rest + [hero]):
+            key = tuple(map(id, order))
+            if key not in seen:
+                seen.add(key)
+                out.append(order)
+    return out
+
+
+_VISUAL = {"hero", "image"}
+_MESSAGE = {"headline", "subhead", "body"}
+# Pulling a ribbon/badge/watermark out of its corner changes the design, so
+# it has to buy a real gain in size to be worth it.
+_MERGE_PENALTY = 0.08
+
+
+def _structure_penalty(cols: list[list[_Row]]) -> float:
+    """Splits a designer wouldn't make: an image stacked over copy or the
+    CTA inside one column of a side-by-side layout, or the headline and its
+    supporting copy spread over several columns."""
+    roles = [{b.role for r in col for b in r.blocks} for col in cols]
+    pen = 0.0
+    for rs in roles:
+        if rs & _VISUAL and rs & (_MESSAGE | {"cta"}):
+            pen += 0.12
+    pen += 0.12 * max(0, sum(1 for rs in roles if rs & _MESSAGE) - 1)
+    return pen
+
+
+def _upper_bound(c: _Ctx, cols: list[list[_Row]], area: _Rect) -> float:
+    """Optimistic scale for a column split (images at full size, one line
+    per text, no gaps), used to skip candidates that cannot win."""
+    ub = c.s_hi
+    rigid = 0.0
+    for col in cols:
+        col = [r for r in col if not all(b.role == "hero" for b in r.blocks)]  # heroes shrink to fit
+        ub = min(ub, area.h / max(sum(r.min_h for r in col), 1e-6))
+        rigid += max((r.natural_w for r in col if not r.flexible), default=0.0)
+    if rigid > 0:
+        ub = min(ub, max(1.0, area.w - c.gutter * (len(cols) - 1)) / rigid)
+    return max(ub, 1e-6)
+
+
+def _small_text(d: _Design, font_sizes: dict[int, float]) -> float:
+    """Importance-weighted shortfall of text below 11px."""
+    return sum(b.importance * max(0.0, 1.0 - font_sizes[it.idx] / 11.0)
+               for b in d.blocks for it in b.items if it.type == "text" and it.idx in font_sizes)
+
+
+def _column_candidates(c: _Ctx, to_beat: float) -> list[_Candidate]:
+    """Every way of cutting the reading order into 2-4 columns (more for
+    wider canvases), best-first by optimistic bound, stopping once no
+    remaining split can beat the best score found."""
+    d = c.d
+    aspect = c.tw / c.th
+    kmax = 1 if aspect < 1.25 else 2 if aspect < 1.6 else 3 if aspect < 2.6 else 4
+    if kmax < 2:
+        return []
+    area = c.area
+    specs = []
+    for merged in ((False, True) if d.corners else (False,)):
+        rows = _rows(d, d.blocks if merged else d.flow)
+        corners = [] if merged else d.corners
+        footers = [None]
+        if len(rows) > 2 and len(rows[-1].blocks) == 1 and rows[-1].blocks[0].role == "fineprint":
+            footers.append(rows[-1])
+        for footer in footers:
+            body = rows[:-1] if footer is not None else rows
+            for order in _orders(body):
+                n = len(order)
+                for k in range(2, min(kmax, n) + 1):
+                    for cuts in itertools.combinations(range(1, n), k - 1):
+                        bounds = (0, *cuts, n)
+                        cols = [order[a:b] for a, b in zip(bounds, bounds[1:])]
+                        pen = _structure_penalty(cols)
+                        ub = _upper_bound(c, cols, area)
+                        # No text can end up larger than at the bound's scale.
+                        small = _small_text(d, {it.idx: max(1, round(it.fs * ub))
+                                                for it in d.items if it.type == "text"})
+                        bound = (math.log(ub / c.s_hi) + 0.3 - pen - 0.6 * small
+                                 - 0.05 * (k - 1) - (_MERGE_PENALTY if merged else 0.0))
+                        specs.append((bound, cols, footer, corners, merged, pen))
+    specs.sort(key=lambda sp: -sp[0])
+    out = []
+    for bound, cols, footer, corners, merged, pen in specs:
+        if bound <= to_beat:
+            break
+        cand = _columns_candidate(c, cols, footer, corners, merged)
+        if cand is None:
+            continue
+        cand.penalty = pen
+        cand.score = _score(c, cand)
+        to_beat = max(to_beat, cand.score)
+        out.append(cand)
+    return out
+
+
+def _drawn_rect(it: _Item, p: dict[str, Any]) -> _Rect:
+    """Where an element's pixels actually land: an image's non-transparent
+    area, a text's lines from cap height to descenders."""
+    r = _Rect.xywh(p["x"], p["y"], p["width"], p["height"])
+    if it.type == "image":
+        l, t, rr, b = it.frac
+        return _Rect(r.x0 + l * r.w, r.y0 + t * r.h, r.x0 + rr * r.w, r.y0 + b * r.h)
+    if it.type == "text":
+        fit = _measure(it.style, int(p["font_size"]), r.w)
+        x0 = {"center": r.cx - fit.text_w / 2, "right": r.x1 - fit.text_w}.get(it.style.align, r.x0)
+        return _Rect(x0, r.y0 + fit.ink_top, x0 + fit.text_w, r.y0 + fit.ink_bottom)
+    return r
+
+
+def _score(c: _Ctx, cand: _Candidate) -> float:
+    """Higher is better. Rewards keeping content large (relative to the
+    most this canvas allows) and filling the canvas; penalises tiny text,
+    collisions between pieces' drawn pixels, extra columns, and pulling
+    corner pieces out of their corners."""
+    d = c.d
+    boxes, drawn = [], []
+    for b in d.blocks:
+        placed = [(it, cand.props[it.idx]) for it in b.items if it.idx in cand.props]
+        if placed:
+            boxes.append(_union_all([_Rect.xywh(p["x"], p["y"], p["width"], p["height"]) for _, p in placed]))
+            drawn.append(_union_all([_drawn_rect(it, p) for it, p in placed]))
+    small = _small_text(d, {i: p["font_size"] for i, p in cand.props.items() if "font_size" in p})
+    fill = _union_all(boxes).area / (c.tw * c.th) if boxes else 0.0
+    # Pieces that touch (closer than ~1% of the canvas) count as colliding.
+    pad = 0.005 * min(c.tw, c.th)
+    drawn = [_Rect(r.x0 - pad, r.y0 - pad, r.x1 + pad, r.y1 + pad) for r in drawn]
+    clash = 0.0
+    for i, a in enumerate(drawn):
+        for o in drawn[i + 1:]:
+            clash += a.overlap(o) / max(1.0, min(a.area, o.area))
+    return (math.log(max(cand.s, 1e-6) / c.s_hi) + 0.3 * fill - 0.6 * small - 1.5 * clash
+            - cand.penalty - 0.05 * (cand.columns - 1) - (_MERGE_PENALTY if cand.merged else 0.0))
+
+
+def _layout(d: _Design, tw: int, th: int) -> dict[int, dict[str, Any]]:
+    c = _ctx(d, tw, th)
+    cands = []
+    for merged in ((False, True) if d.corners else (False,)):
+        for order, pen in _stack_orders(_rows(d, d.blocks if merged else d.flow)):
+            cands.append(_stack_candidate(c, merged, order, pen))
+    keep = _keep_candidate(c)
+    if keep is not None:
+        cands.append(keep)
+    for cand in cands:
+        cand.score = _score(c, cand)
+    cands += _column_candidates(c, max(k.score for k in cands))
+    best = max(cands, key=lambda k: k.score)
+    if _DEBUG:
+        for k in sorted(cands, key=lambda k: -k.score)[:5]:
+            print(f"[resize] {tw}x{th} {k.score:+.3f} s={k.s:.3f} {k.name}"
+                  f"{' (corners in flow)' if k.merged else ''}", file=sys.stderr)
+
+    props = dict(best.props)
+    for it in d.backgrounds:
+        props[it.idx] = {"x": 0, "y": 0, "width": tw, "height": th}
+    sd = max(best.s, min(tw / d.W, th / d.H))
     for it in d.decor:
         props[it.idx] = _place_decor(d, it, sd, tw, th)
     return props
