@@ -57,6 +57,19 @@ _DEBUG = bool(os.environ.get("CHAMELEON_DEBUG"))
 # is used (typical tasks finish in well under half a second).
 _TIME_BUDGET = 2.5
 
+# A decoration that bleeds off the source canvas (like Level 2's corner
+# circle) keeps bleeding by the same share. The starter README calls that
+# sample's off-canvas warning "an expected one". Set False to force every
+# element fully inside the canvas instead.
+_KEEP_BLEED = True
+
+# An image whose asset file is missing would render as a grey "missing
+# asset" box. It is kept (same id, valid geometry) but hidden with opacity 0,
+# which the Level 3 sample's note allows ("skip it, placeholder it"). Only
+# done when other images in the same design load, i.e. the assets folder is
+# the right one. Set False to keep the placeholder visible instead.
+_HIDE_MISSING_ASSETS = True
+
 
 def resize(source: dict[str, Any], target_canvas: dict[str, Any]) -> dict[str, Any]:
     """
@@ -601,6 +614,7 @@ class _Item:
     asset: _Asset | None = None
     frac: tuple[float, float, float, float] = (0.0, 0.0, 1.0, 1.0)
     role: str = ""
+    bleeds: bool = False  # runs off the source canvas
 
 
 def _starts_with_verb(text: str) -> bool:
@@ -804,6 +818,7 @@ class _Design:
         self.backgrounds: list[_Item] = []
         self.decor: list[_Item] = []
         self.backdrops: list[tuple[_Item, list[_Item]]] = []  # (card shape, what it held)
+        self.hidden: list[_Item] = []                          # images with a missing asset
         self.blocks: list[_Block] = []
         self._classify()
 
@@ -824,6 +839,7 @@ class _Design:
         )
         it.box = it.rect.union(_rot_aabb(x, y, w, h, rot))
         it.vis = it.rect
+        it.bleeds = it.box.x0 < -0.5 or it.box.y0 < -0.5 or it.box.x1 > self.W + 0.5 or it.box.y1 > self.H + 0.5
         if etype == "text":
             it.fs = max(1.0, _num(el.get("font_size"), 24.0))
             it.style = _text_style(el)
@@ -862,6 +878,16 @@ class _Design:
                 self.backgrounds.append(it)
             else:
                 live.append(it)
+
+        # Images whose asset file is missing leave the layout and are hidden
+        # (see _HIDE_MISSING_ASSETS) - but only if other images do load, which
+        # shows the assets folder being checked is the right one.
+        if _HIDE_MISSING_ASSETS and any(it.asset and it.asset.exists for it in self.items):
+            for it in live:
+                if it.type == "image" and it.asset is not None and it.asset.exists is False:
+                    it.role = "hidden"
+                    self.hidden.append(it)
+            live = [it for it in live if it.role != "hidden"]
 
         groups: dict[str, list[_Item]] = {}
         for it in live:
@@ -1306,29 +1332,36 @@ def _place_corner(d: _Design, b: _Block, s: float, tw: int, th: int, m: float) -
 
 
 def _place_decor(d: _Design, it: _Item, sd: float, tw: int, th: int) -> dict[str, Any]:
-    """Decorations keep their relationship to the canvas edges: a shape that
-    bleeds off a corner hugs that corner, a full-width band stays full width,
-    anything else keeps its relative position."""
+    """Decorations keep their relationship to the canvas edges. On each axis
+    a piece stays the same (scaled) distance from its nearer edge, so one
+    that bleeds off a corner bleeds off that corner by the same share (see
+    _KEEP_BLEED); a piece near the middle stays near the middle; a band that
+    spans the canvas keeps spanning it."""
     r = it.rect
-    seen = r.intersect(_Rect(0, 0, d.W, d.H)) or r
-    if it.type == "image":
-        seen = r  # images must keep their proportions
-    w, h = seen.w * sd, seen.h * sd
-    left, right = r.x0 <= 1, r.x1 >= d.W - 1
-    top, bottom = r.y0 <= 1, r.y1 >= d.H - 1
     band = it.type == "shape" and it.el.get("shape_type", "rectangle") == "rectangle"
-    if band and left and right:
-        w = tw
-    if band and top and bottom:
-        h = th
-    f = min(1.0, tw / max(w, 1e-6), th / max(h, 1e-6))
-    if not band or it.type == "image":
-        w, h = w * f, h * f
-    else:
-        w, h = min(w, tw), min(h, th)
-    x = 0.0 if left else tw - w if right else seen.cx / d.W * tw - w / 2
-    y = 0.0 if top else th - h if bottom else seen.cy / d.H * th - h / 2
-    x, y = _clamp(x, 0, tw - w), _clamp(y, 0, th - h)
+
+    def place(near: float, far: float, size_src: float, total_src: float, total: int) -> tuple[float, float]:
+        """Start and size along one axis; near/far are the source distances
+        to the two edges (negative when bleeding off that edge)."""
+        size = size_src * sd
+        if band and near <= 1 and far <= 1:
+            return near * sd, total - (near + far) * sd
+        centre = (near + size_src / 2) / total_src
+        if 0.35 <= centre <= 0.65:
+            return centre * total - size / 2, size
+        if near <= far:
+            return near * sd, size
+        return total - far * sd - size, size
+
+    x, w = place(r.x0, d.W - r.x1, r.w, d.W, tw)
+    y, h = place(r.y0, d.H - r.y1, r.h, d.H, th)
+    if not (_KEEP_BLEED and it.bleeds):
+        if band:
+            w, h = min(w, tw), min(h, th)
+        else:
+            f = min(1.0, tw / max(w, 1e-6), th / max(h, 1e-6))
+            w, h = w * f, h * f
+        x, y = _clamp(x, 0, tw - w), _clamp(y, 0, th - h)
     return {"x": x, "y": y, "width": w, "height": h, **_shape_props(it, sd)}
 
 
@@ -1809,6 +1842,17 @@ _FLOORS = {
     "badge": (8, 0.12), "ribbon": (8, 0.12), "fineprint": (7, 0.10),
 }
 
+# When nothing fits, the floors give way in order of importance: fine print
+# and badges first, then supporting copy, the headline and CTA last (after
+# the logo/hero image minimums, which go before any text).
+_FLOOR_TIER = {"headline": 0, "cta": 0, "badge": 2, "ribbon": 2, "fineprint": 2}  # others: 1
+_RELAX_STEPS = (
+    # (headline/CTA, other copy, fine print/badges, logo/hero minimums)
+    (1, 1, 1, 1), (1, 1, 1, 0.6), (1, 1, 1, 0), (1, 1, 0.9, 0), (0.95, 0.95, 0.85, 0),
+    (0.9, 0.9, 0.85, 0), (0.85, 0.85, 0.8, 0), (0.8, 0.8, 0.75, 0), (0.75, 0.7, 0.7, 0),
+    (0.7, 0.65, 0.6, 0), (0.6, 0.55, 0.5, 0), (0.5, 0.45, 0.4, 0),
+)
+
 
 def _candidates(c: _Ctx, deadline: float) -> list[_Candidate]:
     d = c.d
@@ -1863,10 +1907,11 @@ def _layout(d: _Design, tw: int, th: int) -> dict[int, dict[str, Any]]:
     # images' first (every element always stays visible). The best layout
     # from any round wins.
     pool: list[_Candidate] = []
-    for relax, img_relax in ((1, 1), (1, 0.6), (1, 0), (0.8, 0), (0.64, 0), (0.51, 0), (0.41, 0)):
+    for step in _RELAX_STEPS:
+        *text_relax, img_relax = step
         for b in d.blocks:
             px, share = _FLOORS.get(b.role, (9, 0.12))
-            b.floor = relax * min(px, share * short)
+            b.floor = text_relax[_FLOOR_TIER.get(b.role, 1)] * min(px, share * short)
             if b.kind == "image":
                 # Minimum visible height: a brand mark or product that
                 # shrinks to a speck on a small banner isn't "intact", and
@@ -1876,7 +1921,7 @@ def _layout(d: _Design, tw: int, th: int) -> dict[int, dict[str, Any]]:
                 b.k_floor = max(img_relax * want, min(12.0, 0.15 * short)) / max(1.0, b.vis.h)
         cands = _candidates(c, deadline)
         for k in cands:
-            k.name += f" floors x{relax:.2f}/{img_relax:.1f}" if (relax, img_relax) != (1, 1) else ""
+            k.name += f" floors {step}" if step != _RELAX_STEPS[0] else ""
         pool += cands
         if any(k.floored and not k.overflow for k in cands) or time.monotonic() > deadline:
             break
@@ -1893,7 +1938,7 @@ def _layout(d: _Design, tw: int, th: int) -> dict[int, dict[str, Any]]:
     for card, inside in d.backdrops:
         props[card.idx] = _wrap_backdrop(d, card, inside, props, tw, th)
     sd = max(best.s, min(tw / d.W, th / d.H))
-    for it in d.decor:
+    for it in d.decor + d.hidden:
         props[it.idx] = _place_decor(d, it, sd, tw, th)
     return props
 
@@ -1929,21 +1974,26 @@ def _settle(it: _Item, p: dict[str, Any], tw: int, th: int) -> dict[str, Any]:
             h = w / aspect
         x, y = cx - w / 2, cy - h / 2
     fs = max(1, int(round(_num(p.get("font_size"), it.fs)))) if it.type == "text" else None
+    canvas = _Rect(0, 0, tw, th)
+    drawn = _rot_aabb(x, y, w, h, it.rot)
+    # A decoration bleeding like the source stays put if enough of it shows.
+    bleed = (_KEEP_BLEED and it.role == "decor" and it.bleeds
+             and drawn.overlap(canvas) >= 0.1 * max(drawn.area, 1e-9))
 
     for _ in range(60):
         if it.type == "text":
-            w = round(w, 2)
+            w = float(math.ceil(w - 0.01))  # whole pixels
             fit = _measure(it.style, fs, w)
             if fit.text_w > w + 0.5:  # an unbreakable word: widen about the centre
-                grow = fit.text_w + 0.5 - w
-                x, w = x - grow / 2, round(w + grow, 2)
+                grow = float(math.ceil(fit.text_w + 0.5 - w))
+                x, w = x - grow / 2, w + grow
                 fit = _measure(it.style, fs, w)
             if it.rot:
                 y, h = y + h / 2 - max(h, fit.height) / 2, max(h, fit.height)
             else:
                 h = fit.height
         bounds = _Rect.xywh(x, y, w, h).union(_rot_aabb(x, y, w, h, it.rot))
-        if bounds.w <= tw + 0.01 and bounds.h <= th + 0.01:
+        if bleed or (bounds.w <= tw + 0.01 and bounds.h <= th + 0.01):
             break
         f = min(tw / bounds.w, th / bounds.h) * 0.999
         cx, cy = x + w / 2, y + h / 2
@@ -1952,18 +2002,43 @@ def _settle(it: _Item, p: dict[str, Any], tw: int, th: int) -> dict[str, Any]:
         if fs is not None:
             fs = max(1, min(fs - 1, int(fs * f)))
 
-    x, y, w, h = round(x, 2), round(y, 2), round(w, 2), round(h, 2)
-    bounds = _Rect.xywh(x, y, w, h).union(_rot_aabb(x, y, w, h, it.rot))
-    if bounds.x0 < 0:
-        x -= bounds.x0
-    elif bounds.x1 > tw:
-        x -= bounds.x1 - tw
-    if bounds.y0 < 0:
-        y -= bounds.y0
-    elif bounds.y1 > th:
-        y -= bounds.y1 - th
-    x, y = round(_clamp(x, 0, max(0.0, tw - w)), 2), round(_clamp(y, 0, max(0.0, th - h)), 2)
-    out = {"x": x, "y": y, "width": w, "height": h}
+    # Whole pixels render crisply: images and shapes are drawn 1:1 instead of
+    # being resampled, and text starts on a pixel row. (Skipped when rounding
+    # up would no longer fit, e.g. a rotated piece that exactly fills the canvas.)
+    sx, sy, sw, sh = float(round(x)), float(round(y)), w, h
+    if it.type == "text":
+        sh = float(math.ceil(h - 0.01))
+    elif w >= 1 and h >= 1:
+        rw, rh = float(max(1, round(w))), float(max(1, round(h)))
+        exact = it.type == "image" and it.el.get("fit") != "cover"
+        if not exact or abs((rw / rh) / (w / h) - 1) <= 0.02:
+            sw, sh = rw, rh
+    if bleed:
+        shown = _rot_aabb(sx, sy, sw, sh, it.rot)
+        fits = shown.overlap(canvas) >= 0.1 * max(shown.area, 1e-9)
+    else:
+        snapped = _Rect.xywh(sx, sy, sw, sh).union(_rot_aabb(sx, sy, sw, sh, it.rot))
+        fits = snapped.w <= tw + 0.01 and snapped.h <= th + 0.01
+    if fits:
+        x, y, w, h = sx, sy, sw, sh
+    if not bleed:
+        def overhang(x: float, y: float) -> tuple[float, float]:
+            b = _Rect.xywh(x, y, w, h).union(_rot_aabb(x, y, w, h, it.rot))
+            return (-b.x0 if b.x0 < 0 else (tw - b.x1 if b.x1 > tw else 0.0),
+                    -b.y0 if b.y0 < 0 else (th - b.y1 if b.y1 > th else 0.0))
+
+        # Move inside on whole pixels where possible; a rotated piece that
+        # fills the canvas to within a pixel moves by the exact amount.
+        for _ in range(3):
+            dx, dy = overhang(x, y)
+            if not dx and not dy:
+                break
+            x = math.ceil(x + dx) if dx > 0 else math.floor(x + dx) if dx < 0 else x
+            y = math.ceil(y + dy) if dy > 0 else math.floor(y + dy) if dy < 0 else y
+        dx, dy = overhang(x, y)
+        x, y = x + dx, y + dy
+        x, y = _clamp(x, 0, max(0.0, tw - w)), _clamp(y, 0, max(0.0, th - h))
+    out = {"x": round(x, 2), "y": round(y, 2), "width": round(w, 2), "height": round(h, 2)}
     if fs is not None:
         out["font_size"] = fs
         if it.style.letter_spacing:
@@ -1985,6 +2060,8 @@ def _finalise(d: _Design, tw: int, th: int, props: dict[int, dict[str, Any]]) ->
                  "height": it.rect.h * s, "font_size": it.fs * s, **_shape_props(it, s)}
         el = copy.deepcopy(it.src)
         el.update(_settle(it, p, tw, th))
+        if it.role == "hidden":
+            el["opacity"] = 0
         elements.append(el)
     return {"canvas": {"width": tw, "height": th}, "elements": elements}
 
