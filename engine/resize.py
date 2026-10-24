@@ -11,10 +11,12 @@ resize() runs in three stages:
   2. Lay out   (_layout)    Rebuild the design for the target canvas from
                             those pieces: text re-flows, images keep their
                             proportions, grouped pieces travel together,
-                            corner pieces stay in their corners. Several
-                            candidate layouts (one column, 2-4 side-by-side
-                            columns, the source's own arrangement) are
-                            scored and the best one wins.
+                            corner pieces stay in their corners, cards wrap
+                            their contents, and text and key images keep a
+                            readable minimum size. Several candidate layouts
+                            (one column, 2-6 side-by-side columns, the
+                            source's own arrangement) are scored and the
+                            best one wins.
   3. Finalise  (_finalise)  Hard guarantees that hold whatever the layout
                             did: every id exactly once, everything inside the
                             canvas, image aspect ratios kept, integer font
@@ -33,6 +35,7 @@ import math
 import os
 import re
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -50,6 +53,10 @@ except Exception:  # pragma: no cover
 # Set CHAMELEON_DEBUG=1 to print the top-scoring candidate layouts per task.
 _DEBUG = bool(os.environ.get("CHAMELEON_DEBUG"))
 
+# Seconds of layout search per task; past it, the best layout found so far
+# is used (typical tasks finish in well under half a second).
+_TIME_BUDGET = 2.5
+
 
 def resize(source: dict[str, Any], target_canvas: dict[str, Any]) -> dict[str, Any]:
     """
@@ -62,8 +69,9 @@ def resize(source: dict[str, Any], target_canvas: dict[str, Any]) -> dict[str, A
     Returns:
         {"canvas": target_canvas, "elements": [...]} with every source
         element exactly once, in source order, re-laid-out for the target.
-        Only geometry (x/y/width/height), font_size and shape corner/stroke
-        sizes change; content, fonts, colours, assets and fit are untouched.
+        Only geometry (x/y/width/height), font_size, letter_spacing (in
+        step with font_size) and shape corner/stroke sizes change; content,
+        fonts, colours, assets and fit are untouched.
     """
     tw = max(1, int(round(_num(target_canvas.get("width"), 1))))
     th = max(1, int(round(_num(target_canvas.get("height"), 1))))
@@ -652,6 +660,7 @@ class _Block:
     cap_h: float = math.inf     # height limit for the hero image (column layouts)
     floor: float = 0.0          # smallest font size worth printing on this target
     k_floor: float = 0.0        # smallest scale for a logo/hero image on this target
+    backdrop: int | None = None  # index into _Design.backdrops of the card it sits on
     container: _Item | None = None
     label: _Item | None = None
     pad_x: float = 0.0
@@ -794,6 +803,7 @@ class _Design:
         self.items = [self._item(i, el) for i, el in enumerate(source.get("elements") or [])]
         self.backgrounds: list[_Item] = []
         self.decor: list[_Item] = []
+        self.backdrops: list[tuple[_Item, list[_Item]]] = []  # (card shape, what it held)
         self.blocks: list[_Block] = []
         self._classify()
 
@@ -860,6 +870,20 @@ class _Design:
         groups = {k: v for k, v in groups.items() if len(v) > 1}
         singles = [it for it in live if it.group not in groups]
 
+        # A large solid panel behind several texts (a card) is a backdrop:
+        # it isn't laid out itself; once its contents have been placed, it
+        # is wrapped around them again (see _wrap_backdrop).
+        for sh in [it for it in singles if it.type == "shape" and not it.rot and it.opacity >= 0.3]:
+            if sh.el.get("shape_type") == "line" or sh.rect.area < 0.06 * area:
+                continue
+            inside = [it for it in live if it is not sh and (it.z, it.idx) > (sh.z, sh.idx)
+                      and sh.rect.contains_pt(it.vis.cx, it.vis.cy)
+                      and it.vis.overlap(sh.rect) >= 0.8 * max(it.vis.area, 1.0)]
+            if sum(1 for it in inside if it.type == "text") >= 2:
+                sh.role = "backdrop"
+                self.backdrops.append((sh, inside))
+        singles = [it for it in singles if it.role != "backdrop"]
+
         # A text sitting on a snug, solid shape is a button/badge even
         # without a group_id.
         shapes = [it for it in singles if it.type == "shape" and not it.rot and it.opacity >= 0.3]
@@ -904,6 +928,11 @@ class _Design:
 
         self._assign_roles()
         self._find_corners()
+        for k, (_, inside) in enumerate(self.backdrops):
+            held = {id(it) for it in inside}
+            for b in self.blocks:
+                if any(id(it) in held for it in b.items):
+                    b.backdrop = k
 
     def _group_block(self, members: list[_Item]) -> _Block:
         members = sorted(members, key=lambda m: (m.z, m.idx))
@@ -993,6 +1022,11 @@ class _Design:
             if b.role in ("headline", "hero", "divider"):
                 continue
             cx, cy = b.vis.cx / W, b.vis.cy / H
+            # A label turned on its side along the left/right edge stays on
+            # that edge, centred vertically ("ml"/"mr").
+            if all(60 <= abs(m.rot) <= 120 for m in b.items) and (cx <= 0.15 or cx >= 0.85):
+                b.corner = "m" + ("l" if cx < 0.5 else "r")
+                continue
             if not ((cx <= 0.3 or cx >= 0.7) and (cy <= 0.2 or cy >= 0.8)):
                 continue
             if b.box.area > 0.08 * W * H:
@@ -1110,7 +1144,10 @@ def _measure_row_uncached(d: _Design, row: _Row, s: float, max_w: float, final: 
     def line_w(ln: list[_Plan], g: float) -> float:
         return sum(p.w for p in ln) + g * (len(ln) - 1)
 
-    base_gap = max(row.hgap, 0.015 * min(d.W, d.H))
+    # Pieces pushed to opposite edges in the source keep a sensible gap, not
+    # the whole width between them.
+    short = min(d.W, d.H)
+    base_gap = _clamp(row.hgap, 0.015 * short, 0.08 * short)
     plans = [b.measure(s, max_w, final) for b in row.blocks]
     gap = base_gap * s
     # A strip that is a little too wide shrinks to fit (up to 20%) rather
@@ -1136,15 +1173,16 @@ def _measure_row_uncached(d: _Design, row: _Row, s: float, max_w: float, final: 
     widths = [line_w(ln, gap) for ln in lines]
     row_w = max(widths)
     placed: list[tuple[_Plan, float, float]] = []
-    y = 0.0
+    y = vgap = 0.0
     for ln, lw in zip(lines, widths):
         lh = max(p.h for p in ln)
         x = {"left": 0.0, "right": row_w - lw}.get(row.align, (row_w - lw) / 2)
         for p in ln:
             placed.append((p, x, y + (lh - p.h) / 2))
             x += p.w + gap
-        y += lh + gap
-    row_h = y - gap
+        vgap = max(0.015 * short * s, min(gap, 0.3 * lh))  # wrapped lines sit close
+        y += lh + vgap
+    row_h = y - vgap
     inks = [p.ink(ox, oy) for p, ox, oy in placed]
 
     def emit(x: float, y: float) -> dict[int, dict[str, Any]]:
@@ -1226,6 +1264,10 @@ def _row_positions(d: _Design, rows: list[_Row], plans: list[_Plan], gaps: list[
     src += [max(rows[k].vis.y0 - rows[k - 1].vis.y1, 0.0) for k in range(1, len(rows))]
     src.append(d.H - rows[-1].vis.y1)
     weights = [max(v, floor) for v in src]
+    # Keep the composition from going lopsided on a taller canvas: neither
+    # end margin takes more than twice the other's share of the spare room.
+    weights[0] = min(weights[0], 2 * weights[-1])
+    weights[-1] = min(weights[-1], 2 * weights[0])
     extra = [spare * w / sum(weights) for w in weights]
     held = 0.0
     for k in range(1, len(rows)):
@@ -1248,13 +1290,18 @@ def _row_positions(d: _Design, rows: list[_Row], plans: list[_Plan], gaps: list[
 
 
 def _place_corner(d: _Design, b: _Block, s: float, tw: int, th: int, m: float) -> tuple[_Plan, _Rect]:
-    plan = b.measure(s, 0.45 * tw)
-    if plan.h > 0.3 * th:
-        plan = b.measure(s * 0.3 * th / plan.h, 0.45 * tw)
+    side = b.corner[0] == "m"
+    plan = b.measure(s, (0.2 if side else 0.45) * tw)
+    tallest = (0.8 if side else 0.3) * th
+    if plan.h > tallest:
+        plan = b.measure(s * tallest / plan.h, (0.2 if side else 0.45) * tw)
     off_x = _clamp((b.box.x0 if b.corner[1] == "l" else d.W - b.box.x1) * s, 0.5 * m, 2 * m)
-    off_y = _clamp((b.box.y0 if b.corner[0] == "t" else d.H - b.box.y1) * s, 0.5 * m, 2 * m)
     x = off_x if b.corner[1] == "l" else tw - off_x - plan.w
-    y = off_y if b.corner[0] == "t" else th - off_y - plan.h
+    if side:
+        y = (th - plan.h) / 2
+    else:
+        off_y = _clamp((b.box.y0 if b.corner[0] == "t" else d.H - b.box.y1) * s, 0.5 * m, 2 * m)
+        y = off_y if b.corner[0] == "t" else th - off_y - plan.h
     return plan, _Rect.xywh(x, y, plan.w, plan.h)
 
 
@@ -1340,6 +1387,11 @@ def _stack_orders(rows: list[_Row]) -> list[tuple[list[_Row], float]]:
     h = rows.index(hero)
     if not (any(is_copy[:h]) and any(is_copy[h + 1:])):
         return [(rows, 0.0)]
+    # Only when it sat beside the copy: a hero stacked between copy in the
+    # same column is a deliberate order.
+    copy_vis = _union_all([r.vis for r, cp in zip(rows, is_copy) if cp])
+    if min(hero.vis.x1, copy_vis.x1) - max(hero.vis.x0, copy_vis.x0) > 0.3 * hero.vis.w:
+        return [(rows, 0.0)]
     out = [(rows, 0.06)]
     rest = [r for r in rows if r is not hero]
     copy_at = [i for i, r in enumerate(rest) if any(b.role in copy_roles for b in r.blocks)]
@@ -1355,12 +1407,12 @@ def _stack_orders(rows: list[_Row]) -> list[tuple[list[_Row], float]]:
 
 def _stack_candidate(c: _Ctx, merged: bool, rows: list[_Row], penalty: float) -> _Candidate:
     """One column. Corner pieces that would collide with it claim a band
-    along their edge, pushing the column down (or up)."""
+    along their edge, pushing the column down (or up, or in from a side)."""
     d, tw, th = c.d, c.tw, c.th
     corners = [] if merged else d.corners
-    top = bottom = 0.0
+    top = bottom = left = right = 0.0
     for _ in range(4):
-        area = _Rect(c.mx, c.my + top, tw - c.mx, th - c.my - bottom)
+        area = _Rect(c.mx + left, c.my + top, tw - c.mx - right, th - c.my - bottom)
         s, total, plans, gaps = _fit_stack(d, rows, area, c.s_hi)
         pos = _row_positions(d, rows, plans, gaps, total, area, s)
         taken = [p.ink(x, y) for (x, y), p in zip(pos, plans)]
@@ -1369,11 +1421,15 @@ def _stack_candidate(c: _Ctx, merged: bool, rows: list[_Row], penalty: float) ->
         for b, plan, rect in placed:
             if not any(plan.ink(rect.x0, rect.y0).intersects(t, c.clear) for t in taken):
                 continue
-            if b.corner[0] == "t" and rect.y1 + c.clear - c.my > top:
+            if b.corner == "ml" and rect.x1 + c.clear - c.mx > left:
+                left, changed = rect.x1 + c.clear - c.mx, True
+            elif b.corner == "mr" and tw - rect.x0 + c.clear - c.mx > right:
+                right, changed = tw - rect.x0 + c.clear - c.mx, True
+            elif b.corner[0] == "t" and rect.y1 + c.clear - c.my > top:
                 top, changed = rect.y1 + c.clear - c.my, True
             elif b.corner[0] == "b" and th - rect.y0 + c.clear - c.my > bottom:
                 bottom, changed = th - rect.y0 + c.clear - c.my, True
-        if not changed or top + bottom > 0.45 * th:
+        if not changed or top + bottom > 0.45 * th or left + right > 0.4 * tw:
             break
     props: dict[int, dict[str, Any]] = {}
     for (x, y), plan in zip(pos, plans):
@@ -1584,6 +1640,9 @@ def _structure_penalty(cols: list[list[_Row]]) -> float:
     for col in cols:
         if any(b.role == "logo" for r in col[1:] for b in r.blocks):
             pen += 0.05
+    cards = [{b.backdrop for r in col for b in r.blocks if b.backdrop is not None} for col in cols]
+    for k in set().union(*cards):  # a card's contents should stay in one column
+        pen += 0.25 * (sum(1 for ks in cards if k in ks) - 1)
     return pen
 
 
@@ -1642,7 +1701,7 @@ def _small_text(d: _Design, font_sizes: dict[int, float]) -> float:
                for b in d.blocks for it in b.items if it.type == "text" and it.idx in font_sizes)
 
 
-def _column_candidates(c: _Ctx, to_beat: float) -> list[_Candidate]:
+def _column_candidates(c: _Ctx, to_beat: float, deadline: float) -> list[_Candidate]:
     """Every way of cutting the reading order into 2-4 columns (more for
     wider canvases), best-first by optimistic bound, stopping once no
     remaining split can beat the best score found."""
@@ -1664,7 +1723,11 @@ def _column_candidates(c: _Ctx, to_beat: float) -> list[_Candidate]:
             body = rows[:-1] if footer is not None else rows
             for order in _orders(body):
                 n = len(order)
-                for k in range(2, min(kmax, n) + 1):
+                # Many rows: fewer columns, so the number of splits stays sane.
+                top = min(kmax, n)
+                while top > 2 and sum(math.comb(n - 1, k - 1) for k in range(2, top + 1)) > 400:
+                    top -= 1
+                for k in range(2, top + 1):
                     for cuts in itertools.combinations(range(1, n), k - 1):
                         bounds = (0, *cuts, n)
                         cols = [order[a:b] for a, b in zip(bounds, bounds[1:])]
@@ -1682,7 +1745,7 @@ def _column_candidates(c: _Ctx, to_beat: float) -> list[_Candidate]:
     out = []
     # Best-first, so the cap only drops splits that already looked worst.
     for bound, cols, footer, corners, merged, pen in specs[:250]:
-        if bound <= to_beat:
+        if bound <= to_beat or time.monotonic() > deadline:
             break
         cand = _columns_candidate(c, cols, footer, corners, merged)
         if cand is None:
@@ -1747,7 +1810,7 @@ _FLOORS = {
 }
 
 
-def _candidates(c: _Ctx) -> list[_Candidate]:
+def _candidates(c: _Ctx, deadline: float) -> list[_Candidate]:
     d = c.d
     cands = []
     for merged in ((False, True) if d.corners else (False,)):
@@ -1758,12 +1821,43 @@ def _candidates(c: _Ctx) -> list[_Candidate]:
         cands.append(keep)
     for cand in cands:
         cand.score = _score(c, cand)
-    return cands + _column_candidates(c, max(k.score for k in cands))
+    return cands + _column_candidates(c, max(k.score for k in cands), deadline)
+
+
+def _wrap_backdrop(d: _Design, card: _Item, inside: list[_Item], props: dict[int, dict[str, Any]],
+                   tw: int, th: int) -> dict[str, Any]:
+    """Put a card back behind what it held: around their drawn pixels, with
+    the source's padding scaled by how much the contents themselves scaled.
+    If the layout split the contents up, the card wraps the most important
+    piece and whichever others it can reach without covering anything else."""
+    placed = [(it, props[it.idx]) for it in inside if it.idx in props]
+    if not placed:
+        return {"x": 0, "y": 0, "width": min(tw, card.rect.w), "height": min(th, card.rect.h)}
+    held = {id(it) for it in inside}
+    others = [_drawn_rect(it, props[it.idx]) for b in d.blocks for it in b.items
+              if id(it) not in held and it.idx in props]
+    rank = {id(it): b.importance for b in d.blocks for it in b.items}
+    placed.sort(key=lambda ip: -rank.get(id(ip[0]), 0.0))
+    keep = [placed[0]]
+    now = _drawn_rect(*placed[0])
+    for it, p in placed[1:]:
+        grown = now.union(_drawn_rect(it, p))
+        if not any(grown.overlap(o) > 0 for o in others):
+            keep.append((it, p))
+            now = grown
+    placed = keep
+    was = _union_all([it.vis for it, _ in placed])
+    k = math.sqrt(now.area / max(was.area, 1.0))
+    r = _Rect(now.x0 - max(0.0, was.x0 - card.rect.x0) * k, now.y0 - max(0.0, was.y0 - card.rect.y0) * k,
+              now.x1 + max(0.0, card.rect.x1 - was.x1) * k, now.y1 + max(0.0, card.rect.y1 - was.y1) * k)
+    r = _Rect(max(0.0, r.x0), max(0.0, r.y0), min(float(tw), r.x1), min(float(th), r.y1))
+    return {"x": r.x0, "y": r.y0, "width": r.w, "height": r.h, **_shape_props(card, k, r.h)}
 
 
 def _layout(d: _Design, tw: int, th: int) -> dict[int, dict[str, Any]]:
     c = _ctx(d, tw, th)
     short = min(tw, th)
+    deadline = time.monotonic() + _TIME_BUDGET
     # Text and the logo/hero image are held at readable minimum sizes. If
     # no layout fits even then, the floors are relaxed a step at a time, the
     # images' first (every element always stays visible). The best layout
@@ -1780,11 +1874,11 @@ def _layout(d: _Design, tw: int, th: int) -> dict[int, dict[str, Any]]:
                 want = {"logo": min(24.0, 0.3 * th, 0.12 * tw),
                         "hero": min(160.0, 0.4 * th, 0.3 * tw)}.get(b.role, 0.0)
                 b.k_floor = max(img_relax * want, min(12.0, 0.15 * short)) / max(1.0, b.vis.h)
-        cands = _candidates(c)
+        cands = _candidates(c, deadline)
         for k in cands:
             k.name += f" floors x{relax:.2f}/{img_relax:.1f}" if (relax, img_relax) != (1, 1) else ""
         pool += cands
-        if any(k.floored and not k.overflow for k in cands):
+        if any(k.floored and not k.overflow for k in cands) or time.monotonic() > deadline:
             break
     best = max(pool, key=lambda k: k.score)
     if _DEBUG:
@@ -1796,6 +1890,8 @@ def _layout(d: _Design, tw: int, th: int) -> dict[int, dict[str, Any]]:
     props = dict(best.props)
     for it in d.backgrounds:
         props[it.idx] = {"x": 0, "y": 0, "width": tw, "height": th}
+    for card, inside in d.backdrops:
+        props[card.idx] = _wrap_backdrop(d, card, inside, props, tw, th)
     sd = max(best.s, min(tw / d.W, th / d.H))
     for it in d.decor:
         props[it.idx] = _place_decor(d, it, sd, tw, th)
