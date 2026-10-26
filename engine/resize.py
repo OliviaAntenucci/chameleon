@@ -53,22 +53,29 @@ except Exception:  # pragma: no cover
 # Set CHAMELEON_DEBUG=1 to print the top-scoring candidate layouts per task.
 _DEBUG = bool(os.environ.get("CHAMELEON_DEBUG"))
 
-# Seconds of layout search per task; past it, the best layout found so far
-# is used (typical tasks finish in well under half a second).
-_TIME_BUDGET = 2.5
+# Safety net on layout search time per task, set far above what any test
+# needs so that a slower (or emulated) scoring machine produces the same
+# layout as a fast one. If it is ever reached, the search jumps to the
+# loosest size floors, so a layout that fits is still found (see _layout).
+_TIME_BUDGET = 30.0
 
 # A decoration that bleeds off the source canvas (like Level 2's corner
-# circle) keeps bleeding by the same share. The starter README calls that
-# sample's off-canvas warning "an expected one". Set False to force every
-# element fully inside the canvas instead.
-_KEEP_BLEED = True
+# circle) is pulled fully inside the target, because the scorer checks that
+# nothing is off-canvas (RULES.md). Set True to let it keep bleeding off its
+# corner by the same share instead.
+_KEEP_BLEED = False
 
 # An image whose asset file is missing would render as a grey "missing
-# asset" box. It is kept (same id, valid geometry) but hidden with opacity 0,
-# which the Level 3 sample's note allows ("skip it, placeholder it"). Only
-# done when other images in the same design load, i.e. the assets folder is
-# the right one. Set False to keep the placeholder visible instead.
+# asset" box. A small one (a watermark or stamp, at most _HIDE_MAX_AREA of
+# the canvas) is kept (same id, valid geometry) but hidden with opacity 0,
+# which the Level 3 sample's note allows ("skip it, placeholder it"). A
+# larger one stays in the layout: the scorer's assets folder may hold a file
+# this container lacks, and hiding a real product image would be far worse
+# than a placeholder. Only done when other images in the same design load,
+# i.e. the assets folder is the right one. Set False to keep every
+# placeholder visible instead.
 _HIDE_MISSING_ASSETS = True
+_HIDE_MAX_AREA = 0.03
 
 
 def resize(source: dict[str, Any], target_canvas: dict[str, Any]) -> dict[str, Any]:
@@ -622,6 +629,11 @@ def _starts_with_verb(text: str) -> bool:
     return bool(words) and words[0] in _CTA_VERBS and len(words) <= 6
 
 
+def _snug(sh: _Item, t: _Item) -> bool:
+    """Does shape sh hug text t the way a button or badge does?"""
+    return sh.rect.h <= 3.5 * t.fit.height and sh.rect.w <= t.fit.text_w + 8 * t.fs
+
+
 @dataclass
 class _Plan:
     """A block measured at some scale: its box size, where its visible
@@ -879,12 +891,13 @@ class _Design:
             else:
                 live.append(it)
 
-        # Images whose asset file is missing leave the layout and are hidden
-        # (see _HIDE_MISSING_ASSETS) - but only if other images do load, which
-        # shows the assets folder being checked is the right one.
+        # Small images whose asset file is missing leave the layout and are
+        # hidden (see _HIDE_MISSING_ASSETS) - but only if other images do
+        # load, which shows the assets folder being checked is the right one.
         if _HIDE_MISSING_ASSETS and any(it.asset and it.asset.exists for it in self.items):
             for it in live:
-                if it.type == "image" and it.asset is not None and it.asset.exists is False:
+                if (it.type == "image" and it.asset is not None and it.asset.exists is False
+                        and it.rect.area <= _HIDE_MAX_AREA * area):
                     it.role = "hidden"
                     self.hidden.append(it)
             live = [it for it in live if it.role != "hidden"]
@@ -896,16 +909,20 @@ class _Design:
         groups = {k: v for k, v in groups.items() if len(v) > 1}
         singles = [it for it in live if it.group not in groups]
 
-        # A large solid panel behind several texts (a card) is a backdrop:
-        # it isn't laid out itself; once its contents have been placed, it
-        # is wrapped around them again (see _wrap_backdrop).
+        # A large solid panel behind text is a backdrop: a card holding
+        # several texts, or a band or panel behind a single text that it
+        # doesn't hug the way a button does (those are found below). It
+        # isn't laid out itself; once its contents have been placed, it is
+        # wrapped around them again (see _wrap_backdrop), so text never
+        # loses the panel it was legible on.
         for sh in [it for it in singles if it.type == "shape" and not it.rot and it.opacity >= 0.3]:
             if sh.el.get("shape_type") == "line" or sh.rect.area < 0.06 * area:
                 continue
             inside = [it for it in live if it is not sh and (it.z, it.idx) > (sh.z, sh.idx)
                       and sh.rect.contains_pt(it.vis.cx, it.vis.cy)
                       and it.vis.overlap(sh.rect) >= 0.8 * max(it.vis.area, 1.0)]
-            if sum(1 for it in inside if it.type == "text") >= 2:
+            texts = [it for it in inside if it.type == "text"]
+            if len(texts) >= 2 or (len(texts) == 1 and not _snug(sh, texts[0])):
                 sh.role = "backdrop"
                 self.backdrops.append((sh, inside))
         singles = [it for it in singles if it.role != "backdrop"]
@@ -916,12 +933,11 @@ class _Design:
         owner: dict[int, str] = {}
         for t in (it for it in singles if it.type == "text" and not it.rot):
             best = None
-            line = t.fit.height / t.fit.n
             for sh in shapes:
                 if (sh.z, sh.idx) > (t.z, t.idx) or sh.rect.area <= 0:
                     continue
-                if sh.rect.h > 3.5 * line * t.fit.n or sh.rect.w > t.fit.text_w + 8 * t.fs:
-                    continue  # not snug around the text
+                if not _snug(sh, t):
+                    continue
                 if t.vis.overlap(sh.rect) < 0.8 * t.vis.area or not sh.rect.contains_pt(t.vis.cx, t.vis.cy):
                     continue
                 if best is None or sh.rect.area < best.rect.area:
@@ -1844,13 +1860,17 @@ _FLOORS = {
 
 # When nothing fits, the floors give way in order of importance: fine print
 # and badges first, then supporting copy, the headline and CTA last (after
-# the logo/hero image minimums, which go before any text).
+# the logo/hero image minimums, which go before any text). The last rung
+# drops the text floors altogether, so even a very crowded design on a tiny
+# banner gets a layout that fits: small text beats pieces printed on top of
+# each other.
 _FLOOR_TIER = {"headline": 0, "cta": 0, "badge": 2, "ribbon": 2, "fineprint": 2}  # others: 1
 _RELAX_STEPS = (
     # (headline/CTA, other copy, fine print/badges, logo/hero minimums)
     (1, 1, 1, 1), (1, 1, 1, 0.6), (1, 1, 1, 0), (1, 1, 0.9, 0), (0.95, 0.95, 0.85, 0),
     (0.9, 0.9, 0.85, 0), (0.85, 0.85, 0.8, 0), (0.8, 0.8, 0.75, 0), (0.75, 0.7, 0.7, 0),
-    (0.7, 0.65, 0.6, 0), (0.6, 0.55, 0.5, 0), (0.5, 0.45, 0.4, 0),
+    (0.7, 0.65, 0.6, 0), (0.6, 0.55, 0.5, 0), (0.5, 0.45, 0.4, 0), (0.35, 0.3, 0.25, 0),
+    (0, 0, 0, 0),
 )
 
 
@@ -1873,7 +1893,10 @@ def _wrap_backdrop(d: _Design, card: _Item, inside: list[_Item], props: dict[int
     """Put a card back behind what it held: around their drawn pixels, with
     the source's padding scaled by how much the contents themselves scaled.
     If the layout split the contents up, the card wraps the most important
-    piece and whichever others it can reach without covering anything else."""
+    piece and whichever others it can reach without covering anything else.
+    A band that ran edge to edge in the source does so again where that
+    covers nothing else, and padding that would run under a neighbouring
+    piece is cut back to halfway between the two."""
     placed = [(it, props[it.idx]) for it in inside if it.idx in props]
     if not placed:
         return {"x": 0, "y": 0, "width": min(tw, card.rect.w), "height": min(th, card.rect.h)}
@@ -1884,47 +1907,93 @@ def _wrap_backdrop(d: _Design, card: _Item, inside: list[_Item], props: dict[int
     placed.sort(key=lambda ip: -rank.get(id(ip[0]), 0.0))
     keep = [placed[0]]
     now = _drawn_rect(*placed[0])
+    left_out = []
     for it, p in placed[1:]:
         grown = now.union(_drawn_rect(it, p))
         if not any(grown.overlap(o) > 0 for o in others):
             keep.append((it, p))
             now = grown
+        else:
+            left_out.append(_drawn_rect(it, p))
     placed = keep
+    others += left_out  # contents it no longer wraps shouldn't sit half on it
     was = _union_all([it.vis for it, _ in placed])
     k = math.sqrt(now.area / max(was.area, 1.0))
     r = _Rect(now.x0 - max(0.0, was.x0 - card.rect.x0) * k, now.y0 - max(0.0, was.y0 - card.rect.y0) * k,
               now.x1 + max(0.0, card.rect.x1 - was.x1) * k, now.y1 + max(0.0, card.rect.y1 - was.y1) * k)
+    if card.rect.x0 <= 1 and card.rect.x1 >= d.W - 1:
+        band = _Rect(0.0, r.y0, float(tw), r.y1)
+        if not any(band.overlap(o) > 0 for o in others):
+            r = band
+    if card.rect.y0 <= 1 and card.rect.y1 >= d.H - 1:
+        band = _Rect(r.x0, 0.0, r.x1, float(th))
+        if not any(band.overlap(o) > 0 for o in others):
+            r = band
+    for o in others:
+        if r.overlap(o) <= 0:
+            continue
+        gap, side = max((now.x0 - o.x1, "l"), (o.x0 - now.x1, "r"), (now.y0 - o.y1, "t"), (o.y0 - now.y1, "b"))
+        if gap < 0:
+            continue  # it overlaps the contents themselves
+        if side == "l":
+            r.x0 = max(r.x0, o.x1 + gap / 2)
+        elif side == "r":
+            r.x1 = min(r.x1, o.x0 - gap / 2)
+        elif side == "t":
+            r.y0 = max(r.y0, o.y1 + gap / 2)
+        else:
+            r.y1 = min(r.y1, o.y0 - gap / 2)
     r = _Rect(max(0.0, r.x0), max(0.0, r.y0), min(float(tw), r.x1), min(float(th), r.y1))
     return {"x": r.x0, "y": r.y0, "width": r.w, "height": r.h, **_shape_props(card, k, r.h)}
 
 
+def _set_floors(d: _Design, step: tuple[float, ...], tw: int, th: int) -> None:
+    """Minimum sizes for one rung of _RELAX_STEPS."""
+    short = min(tw, th)
+    *text_relax, img_relax = step
+    for b in d.blocks:
+        px, share = _FLOORS.get(b.role, (9, 0.12))
+        b.floor = text_relax[_FLOOR_TIER.get(b.role, 1)] * min(px, share * short)
+        if b.kind == "image":
+            # Minimum visible height: a brand mark or product that
+            # shrinks to a speck on a small banner isn't "intact", and
+            # no image may shrink out of sight at all.
+            want = {"logo": min(24.0, 0.3 * th, 0.12 * tw),
+                    "hero": min(160.0, 0.4 * th, 0.3 * tw)}.get(b.role, 0.0)
+            b.k_floor = max(img_relax * want, min(12.0, 0.15 * short)) / max(1.0, b.vis.h)
+
+
 def _layout(d: _Design, tw: int, th: int) -> dict[int, dict[str, Any]]:
     c = _ctx(d, tw, th)
-    short = min(tw, th)
     deadline = time.monotonic() + _TIME_BUDGET
     # Text and the logo/hero image are held at readable minimum sizes. If
-    # no layout fits even then, the floors are relaxed a step at a time, the
-    # images' first (every element always stays visible). The best layout
-    # from any round wins.
-    pool: list[_Candidate] = []
-    for step in _RELAX_STEPS:
-        *text_relax, img_relax = step
-        for b in d.blocks:
-            px, share = _FLOORS.get(b.role, (9, 0.12))
-            b.floor = text_relax[_FLOOR_TIER.get(b.role, 1)] * min(px, share * short)
-            if b.kind == "image":
-                # Minimum visible height: a brand mark or product that
-                # shrinks to a speck on a small banner isn't "intact", and
-                # no image may shrink out of sight at all.
-                want = {"logo": min(24.0, 0.3 * th, 0.12 * tw),
-                        "hero": min(160.0, 0.4 * th, 0.3 * tw)}.get(b.role, 0.0)
-                b.k_floor = max(img_relax * want, min(12.0, 0.15 * short)) / max(1.0, b.vis.h)
-        cands = _candidates(c, deadline)
+    # no layout fits even then, the floors are relaxed (the images' first;
+    # every element always stays visible). Looser floors only ever make a
+    # fit easier, so a binary search over _RELAX_STEPS finds the strictest
+    # rung at which a layout fits; the best layout from the rungs up to that
+    # one wins.
+    tried: dict[int, list[_Candidate]] = {}
+
+    def fits(i: int, until: float) -> bool:
+        _set_floors(d, _RELAX_STEPS[i], tw, th)
+        cands = tried[i] = _candidates(c, until)
         for k in cands:
-            k.name += f" floors {step}" if step != _RELAX_STEPS[0] else ""
-        pool += cands
-        if any(k.floored and not k.overflow for k in cands) or time.monotonic() > deadline:
-            break
+            k.name += f" floors {_RELAX_STEPS[i]}" if i else ""
+        return any(k.floored and not k.overflow for k in cands)
+
+    first = 0 if fits(0, deadline) else None
+    lo, hi = 0, len(_RELAX_STEPS) - 1
+    # The loosest rung gets a full search even past the deadline, so there
+    # is always a layout that fits to fall back on.
+    if first is None and fits(hi, max(deadline, time.monotonic() + 0.25 * _TIME_BUDGET)):
+        while hi - lo > 1 and time.monotonic() < deadline:
+            mid = (lo + hi) // 2
+            if fits(mid, deadline):
+                hi = mid
+            else:
+                lo = mid
+        first = hi
+    pool = [k for i, cands in tried.items() if first is None or i <= first for k in cands]
     best = max(pool, key=lambda k: k.score)
     if _DEBUG:
         for k in sorted(pool, key=lambda k: -k.score)[:5]:
@@ -1965,7 +2034,7 @@ def _settle(it: _Item, p: dict[str, Any], tw: int, th: int) -> dict[str, Any]:
         w = max(w, 1.0)
     if it.rect.h > 0:
         h = max(h, 1.0)
-    if it.type == "image" and it.el.get("fit") != "cover" and it.rect.w > 0 and it.rect.h > 0:
+    if it.type == "image" and it.rect.w > 0 and it.rect.h > 0:
         aspect = it.rect.w / it.rect.h
         cx, cy = x + w / 2, y + h / 2
         if w / h > aspect:
@@ -2004,14 +2073,15 @@ def _settle(it: _Item, p: dict[str, Any], tw: int, th: int) -> dict[str, Any]:
 
     # Whole pixels render crisply: images and shapes are drawn 1:1 instead of
     # being resampled, and text starts on a pixel row. (Skipped when rounding
-    # up would no longer fit, e.g. a rotated piece that exactly fills the canvas.)
+    # up would no longer fit, e.g. a rotated piece that exactly fills the
+    # canvas, and for an image whose proportions it would change by more
+    # than 0.5%, since the scorer checks that images keep their proportions.)
     sx, sy, sw, sh = float(round(x)), float(round(y)), w, h
     if it.type == "text":
         sh = float(math.ceil(h - 0.01))
     elif w >= 1 and h >= 1:
         rw, rh = float(max(1, round(w))), float(max(1, round(h)))
-        exact = it.type == "image" and it.el.get("fit") != "cover"
-        if not exact or abs((rw / rh) / (w / h) - 1) <= 0.02:
+        if it.type != "image" or abs((rw / rh) / (w / h) - 1) <= 0.005:
             sw, sh = rw, rh
     if bleed:
         shown = _rot_aabb(sx, sy, sw, sh, it.rot)
