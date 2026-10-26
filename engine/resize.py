@@ -1967,34 +1967,28 @@ def _layout(d: _Design, tw: int, th: int) -> dict[int, dict[str, Any]]:
     c = _ctx(d, tw, th)
     deadline = time.monotonic() + _TIME_BUDGET
     # Text and the logo/hero image are held at readable minimum sizes. If
-    # no layout fits even then, the floors are relaxed (the images' first;
-    # every element always stays visible). Looser floors only ever make a
-    # fit easier, so a binary search over _RELAX_STEPS finds the strictest
-    # rung at which a layout fits; the best layout from the rungs up to that
-    # one wins.
-    tried: dict[int, list[_Candidate]] = {}
-
-    def fits(i: int, until: float) -> bool:
+    # no layout fits even then, the floors are relaxed a step at a time, the
+    # images' first (every element always stays visible). The best layout
+    # from any round wins. If time runs out before anything fits, the search
+    # jumps to the loosest rung, which always gets a full search, so there
+    # is still a layout that fits.
+    pool: list[_Candidate] = []
+    last = len(_RELAX_STEPS) - 1
+    i = 0
+    while True:
         _set_floors(d, _RELAX_STEPS[i], tw, th)
-        cands = tried[i] = _candidates(c, until)
+        until = deadline if i < last else max(deadline, time.monotonic() + 0.25 * _TIME_BUDGET)
+        cands = _candidates(c, until)
         for k in cands:
             k.name += f" floors {_RELAX_STEPS[i]}" if i else ""
-        return any(k.floored and not k.overflow for k in cands)
-
-    first = 0 if fits(0, deadline) else None
-    lo, hi = 0, len(_RELAX_STEPS) - 1
-    # The loosest rung gets a full search even past the deadline, so there
-    # is always a layout that fits to fall back on.
-    if first is None and fits(hi, max(deadline, time.monotonic() + 0.25 * _TIME_BUDGET)):
-        while hi - lo > 1 and time.monotonic() < deadline:
-            mid = (lo + hi) // 2
-            if fits(mid, deadline):
-                hi = mid
-            else:
-                lo = mid
-        first = hi
-    pool = [k for i, cands in tried.items() if first is None or i <= first for k in cands]
-    best = max(pool, key=lambda k: k.score)
+        pool += cands
+        if any(k.floored and not k.overflow for k in cands) or i == last:
+            break
+        i = last if time.monotonic() > deadline else i + 1
+    # A layout that overflows gets squeezed into the canvas piece by piece
+    # (see _settle), which piles pieces on top of each other, so any layout
+    # that fits beats every one that doesn't, however small its text.
+    best = max([k for k in pool if not k.overflow] or pool, key=lambda k: k.score)
     if _DEBUG:
         for k in sorted(pool, key=lambda k: -k.score)[:5]:
             print(f"[resize] {tw}x{th} {k.score:+.3f} s={k.s:.3f} {k.name}"

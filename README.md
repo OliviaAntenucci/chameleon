@@ -3,8 +3,8 @@
 Give the engine a finished design and a new canvas size; it rebuilds the
 design for that canvas instead of stretching it. Text re-flows, images keep
 their proportions, buttons stay buttons, corner badges stay in their corners,
-and every element of the original is still there and visible (except an
-image whose file is missing, which has nothing to show).
+and every element of the original is still there and visible (except a
+small image whose file is missing, which has nothing to show).
 
 All of the engine lives in `engine/resize.py`. Everything else is the
 starter kit's plumbing, unchanged.
@@ -85,10 +85,11 @@ Nothing is added to `requirements.txt` or the `Dockerfile`.
 order (never element ids), the engine works out what each piece is:
 full-bleed backgrounds, decorations (translucent shapes, dots), the logo,
 the hero image, the headline and supporting copy, fine print, buttons (a
-text on a snug shape, with or without a `group_id`), badge strips, cards (a
-panel behind several texts), and small pieces tucked into a corner or along
-an edge (a sale ribbon, a watermark, a vertical side label). Text is
-measured exactly as the renderer will draw it.
+text on a snug shape, with or without a `group_id`), badge strips, cards and
+bands (a solid panel behind several texts, or behind one text it doesn't hug
+the way a button does), and small pieces tucked into a corner or along an
+edge (a sale ribbon, a watermark, a vertical side label). Text is measured
+exactly as the renderer will draw it.
 
 **2. Generate and score candidate layouts.** For each target the engine
 builds several complete layouts and keeps the best:
@@ -106,7 +107,10 @@ Text never drops below a readable minimum for its role (headline, body, CTA,
 badge, fine print), scaled to the canvas; the logo and hero image keep a
 minimum visible size; no element is ever shrunk out of sight. If nothing
 fits even then, the minimums are relaxed a step at a time, fine print and
-badges first and the headline and CTA last.
+badges first and the headline and CTA last; the last step drops the text
+minimums altogether, so even a very crowded design on a tiny banner gets a
+layout where nothing overlaps. Any layout that fits beats every one that
+doesn't.
 
 Candidates are scored on how large the content stays (weighted by
 importance), how well it fills the canvas, overlap between drawn pixels of
@@ -114,37 +118,42 @@ unrelated pieces, text below 11px, and arrangements a designer would avoid
 (a headline split from its subhead across columns, an image stacked over
 copy inside a column, a logo below the product, a card's contents split
 apart). Corner pieces either keep their corner or join the flow when that
-reads better.
+reads better. Cards and bands are then wrapped back around the text they
+held (a band that ran edge to edge still does, where that covers nothing
+else), so text never loses the panel it was legible on.
 
 **3. Finalise.** Hard guarantees, whatever the layout did: every element id
 exactly once and in source order; everything inside the canvas, including
-the bounds of rotated elements (the one deliberate exception is below);
-non-background images keep their aspect ratio; integer font sizes; text
-boxes tall enough for their text; content, font family, colours, assets and
-`fit` untouched. Geometry is snapped to whole pixels so images and shapes
-are drawn 1:1 rather than resampled, which keeps small banners crisp. If
-the analysis or layout ever raises, a proportional fit-inside fallback still
-produces a valid result, so a task never fails.
+the bounds of rotated elements; non-background images keep their aspect
+ratio (to within 0.5%); integer font sizes; text boxes tall enough for their
+text; content, font family, colours, assets and `fit` untouched. Geometry is
+snapped to whole pixels so images and shapes are drawn 1:1 rather than
+resampled, which keeps small banners crisp (an image only snaps when that
+keeps its proportions within 0.5%). If the analysis or layout ever raises, a
+proportional fit-inside fallback still produces a valid result, so a task
+never fails.
 
 Two behaviours have a one-line switch at the top of `engine/resize.py`:
 
-- `_KEEP_BLEED` (on): a decoration that runs off the edge of the source
-  canvas, like Level 2's corner circle, keeps running off that corner by the
-  same share instead of being squashed inside. The starter kit's README
-  called that sample's off-canvas warning "an expected one", so `main.py`'s
-  self-check still prints it for that element.
-- `_HIDE_MISSING_ASSETS` (on): an image whose asset file doesn't exist (like
-  Level 3's `holiday_watermark`) keeps its id and valid geometry but is
-  hidden with `opacity: 0` instead of rendering as a grey "missing asset"
-  box. The Level 3 sample's note allows this ("skip it, placeholder it").
-  It only happens when other images in the same design load, so a wrong
-  assets folder can never hide real images.
+- `_KEEP_BLEED` (off): a decoration that runs off the edge of the source
+  canvas, like Level 2's corner circle, is pulled fully inside the target,
+  because the scorer checks that nothing is off-canvas. Turn it on to let it
+  keep running off its corner by the same share instead.
+- `_HIDE_MISSING_ASSETS` (on): a small image whose asset file doesn't exist
+  (at most `_HIDE_MAX_AREA`, 3% of the canvas, like Level 3's
+  `holiday_watermark`) keeps its id and valid geometry but is hidden with
+  `opacity: 0` instead of rendering as a grey "missing asset" box. The
+  Level 3 sample's note allows this ("skip it, placeholder it"). A larger
+  missing image stays in the layout: the scorer's assets folder may have a
+  file this container doesn't, and hiding a real product image would be far
+  worse than a placeholder. Hiding only happens when other images in the
+  same design load, so a wrong assets folder can never hide real images.
 
 ## What stays and what adapts
 
 | Constant | Adapts |
 |---|---|
-| Every element (visible unless its image file is missing) | Positions and sizes |
+| Every element (visible unless it's a small image whose file is missing) | Positions and sizes |
 | Text content and font family | Font size (and letter spacing with it) |
 | Colours, assets, image proportions | Line breaks, column arrangement |
 | Grouped pieces kept together | Spacing, corner radii, stroke widths |
@@ -152,9 +161,15 @@ Two behaviours have a one-line switch at the top of `engine/resize.py`:
 
 ## Performance
 
-Most tasks take 2–50 ms; the busiest sample (Level 3 at 728×90) takes about
-0.6 s. A per-task time budget of 2.5 s caps the layout search; past it, the
-best layout found so far is used.
+Most tasks take 2–50 ms. The slowest sample tasks (Level 3 on small
+banners) take 1–2 s, and a crowded 35-element design on a banner takes up to
+about 10 s (measured on a Windows PC). The 30 s per-task time budget is only
+a safety net, set far above what any test needs, so a slower or emulated
+scoring machine (stage one runs a `linux/amd64` image on an Apple M5 Pro)
+produces the same layouts: on a simulated machine 4× slower, the hardest
+tests came out the same (same font sizes, no overlaps). If the budget is
+ever reached, the search jumps straight to the loosest size minimums, so it
+still returns a layout that fits.
 
 ## Testing
 
@@ -170,17 +185,27 @@ best layout found so far is used.
 - A random-design fuzzer (2,200 cases, including degenerate canvases such
   as 20×1 and 4000×90): no crashes, no fallbacks, and every structural rule
   held in every case.
+- A stress sweep of each sample at its own target plus 23 common formats,
+  re-checked independently of the engine (ids, required fields, nothing
+  off-canvas including rotated bounds, image proportions, and text that fits
+  its box using the renderer's own wrapping) and with `main.py`'s
+  self-check: no warnings. Also a headline on a full-width band (it stays
+  on its band at every size), a 35-element design (no overlapping pieces on
+  any banner), and a simulated slower machine (see Performance).
 
 ## Operating limitations
 
 - **Very small canvases with many elements.** Every element stays visible,
   so on, e.g., a 320×50 banner the Level 3 sample's 17 elements leave some
-  text at 3–5px. Dropping low-priority elements would read better, but the
-  challenge guidance asks for every input element to remain visible.
+  text at 2–6px. Dropping low-priority elements would read better, but the
+  rules require every element id to be returned, and hiding content could be
+  judged as removing it.
 - **Copy is never rewritten** and font families never change (stage-one
   rules), so very long text can only shrink and re-wrap.
-- **Missing assets** are hidden (see `_HIDE_MISSING_ASSETS`): the element
-  stays in the output, but there is no image to show, so it isn't drawn.
+- **Small missing assets** are hidden (see `_HIDE_MISSING_ASSETS`): the
+  element stays in the output, but there is no image to show, so it isn't
+  drawn. A large missing image is laid out normally and renders as the
+  renderer's placeholder.
 - **Small banners stay small images.** The PNG is rendered at the target
   size, so a 728×90 result is 728×90 pixels; zoomed in, any text that small
   looks soft.
